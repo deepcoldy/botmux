@@ -86,6 +86,12 @@ export class TraexNativeContinuationTracker {
         if (isNestedContinuation || isUnownedRootTurn) {
           this.activeTranscriptTurns.delete(ev.turnId);
           this.activeTranscriptTurns.set(ev.turnId, ev.rootTurnId);
+          // A fresh transcript continuation reopens work: any OSC-only anchor
+          // counted from an earlier window is invalid. Clearing here (not just
+          // in the end-of-batch reconcile) makes a start+end arriving in the
+          // SAME drain batch equivalent to separate batches — the anchor for
+          // the re-entered OSC-only state starts at this batch's terminal edge.
+          this.programStatusOnlySinceMs = undefined;
           while (this.activeTranscriptTurns.size > MAX_ACTIVE_TRANSCRIPT_CONTINUATIONS) {
             const oldest = this.activeTranscriptTurns.keys().next().value;
             if (oldest === undefined) break;

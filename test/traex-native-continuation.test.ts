@@ -356,6 +356,52 @@ describe('TraexNativeContinuationTracker & drainTraexRollout', () => {
     expect(tracker.programStatusOnlyForMs(Date.now(), true)).toBe(70_000);
     vi.useRealTimers();
   });
+
+  it('restarts the OSC-only anchor at the terminal edge whether a start+end arrive in one batch or two', () => {
+    vi.useFakeTimers();
+    const base = Date.parse('2026-11-28T00:00:00.000Z');
+
+    const buildOscOnly = () => {
+      vi.setSystemTime(base);
+      const tracker = new TraexNativeContinuationTracker();
+      tracker.observeProgramStatus({
+        state: 'working', wasPromptReady: true, programStatusHeldWorking: true,
+        hasBotmuxTurnOwner: false, botmuxOperationInFlight: false,
+      });
+      return tracker;
+    };
+
+    // Same drain batch: B has been OSC-only since t0; A's start and end land
+    // together at t120. The fresh start must invalidate B's old anchor.
+    const same = buildOscOnly();
+    vi.setSystemTime(base + 120_000);
+    same.observeTranscriptLifecycle(
+      [
+        { kind: 'started', turnId: 'A', rootTurnId: 'root' },
+        { kind: 'ended', turnId: 'A' },
+      ],
+      {},
+      true,
+    );
+    expect(same.hasTranscriptContinuation()).toBe(false);
+    expect(same.programStatusOnlyForMs(base + 120_000, true)).toBe(0);
+
+    // Separate batches: start at t120, end one ms later — same fresh anchor.
+    const separate = buildOscOnly();
+    vi.setSystemTime(base + 120_000);
+    separate.observeTranscriptLifecycle(
+      [{ kind: 'started', turnId: 'A', rootTurnId: 'root' }], {}, true,
+    );
+    expect(separate.programStatusOnlyForMs(base + 120_000, true)).toBeUndefined();
+    vi.setSystemTime(base + 120_000 + 1);
+    separate.observeTranscriptLifecycle([{ kind: 'ended', turnId: 'A' }], {}, true);
+    expect(separate.programStatusOnlyForMs(base + 120_000 + 1, true)).toBe(0);
+
+    // Both must still require the full quiet window after the new terminal.
+    vi.setSystemTime(base + 120_000 + STALE_PROGRAM_STATUS_QUIET_MS - 1);
+    expect(same.programStatusOnlyForMs(Date.now(), true)).toBe(STALE_PROGRAM_STATUS_QUIET_MS - 1);
+    vi.useRealTimers();
+  });
 });
 
 describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE native continuation', () => {
@@ -1067,6 +1113,59 @@ describe('Worker resetTraexAutoModelBeforePendingTurn & flushPending during TRAE
     expect(early.detector.isIdleNow()).toBe(true);
     expect(early.scope.traexNativeContinuationActive()).toBe(false);
     expect(early.scope.traexNativeContinuation.programStatusOnlyForMs(Date.now(), false)).toBeUndefined();
+    vi.useRealTimers();
+  });
+
+  it('vetoes the stale release when a fresh task_started is already flushed to disk but not yet drained', () => {
+    vi.useFakeTimers();
+    const base = Date.parse('2026-11-28T00:00:00.000Z');
+    vi.setSystemTime(base);
+
+    const h = buildWorkerHarness({ reselectPerTurn: false });
+    const { scope, rolloutPath, detector } = h;
+    Object.assign(scope, {
+      backgroundTaskTracker: { pending: () => 0 },
+      staleProgramStatusVerdict,
+      viewportShowsIdlePrompt: () => true,
+    });
+    scope.checkStaleProgramStatus = loadWorkerFunction('checkStaleProgramStatus', scope);
+
+    // B opens and closes; OSC done is lost -> OSC-only stuck state.
+    scope.onPtyData('\x1b]7501;state=working:app=traecli\x1b\\');
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-B', 'native-root', new Date(base).toISOString())
+        + traexTaskComplete('native-B', 'B done', new Date(base + 1_000).toISOString()),
+    );
+    scope.codexBridgeIngest();
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(false);
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+
+    // Past every quiet window, the viewport is idle — but a sibling A has
+    // already flushed a task_started to the rollout that the worker has not
+    // drained yet.
+    vi.setSystemTime(base + STALE_PROGRAM_STATUS_QUIET_MS + 5_000);
+    appendFileSync(
+      rolloutPath,
+      traexTaskStarted('native-A', 'native-root', new Date(base + STALE_PROGRAM_STATUS_QUIET_MS + 4_000).toISOString()),
+    );
+
+    // The revalidate drain inside the stale check must observe A and veto the
+    // release instead of trusting the cached OSC-only tracker state.
+    scope.checkStaleProgramStatus();
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    expect(detector.isIdleNow()).toBe(false);
+    expect(scope.traexNativeContinuation.hasTranscriptContinuation()).toBe(true);
+    expect(scope.traexNativeContinuationActive()).toBe(true);
+
+    // Once A closes and its own OSC terminal arrives, normal idle is admitted.
+    appendFileSync(
+      rolloutPath,
+      traexTaskComplete('native-A', 'A done', new Date(base + STALE_PROGRAM_STATUS_QUIET_MS + 6_000).toISOString()),
+    );
+    scope.onPtyData('\x1b]7501;state=done:app=traecli\x1b\\');
+    scope.codexBridgeIngest();
+    expect(scope.traexNativeContinuationActive()).toBe(false);
     vi.useRealTimers();
   });
 });

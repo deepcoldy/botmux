@@ -35785,12 +35785,23 @@ function checkStaleProgramStatus(): void {
   const detector = idleDetector;
   const be = backend;
   if (!detector || !be) return;
-  const now = Date.now();
-  const heldWorking = detector.programStatusHeldWorking();
   // TRAE has no Claude-style transcript turn-end feed. Its stale-OSC anchor is
   // the tracker's OSC-only window: every native continuation has closed in the
   // rollout while an OSC 7501 working hold is still present (lost terminal report).
   const isTraexNative = lastInitConfig?.cliId === 'traex' && !lastInitConfig?.adoptMode;
+  // Revalidate the bound rollout BEFORE trusting the cached OSC-only state: a
+  // task_started already flushed to disk but not yet drained proves a live
+  // continuation and must veto the release. The drain feeds the tracker, which
+  // reopens a transcript continuation and clears its OSC-only anchor, so the
+  // verdict below returns 'stop'. Synchronous: structuredBridgeIngestPath reads
+  // the file inline, and fireIdle stays suppressed while the tracker is active.
+  if (isTraexNative && detector.programStatusHeldWorking()) {
+    try { codexBridgeIngest(); } catch (err: any) {
+      log(`TRAE stale-OSC revalidate drain failed: ${err.message}`);
+    }
+  }
+  const now = Date.now();
+  const heldWorking = detector.programStatusHeldWorking();
   const transcriptEndedForMs = isTraexNative
     ? traexNativeContinuation.programStatusOnlyForMs(now, heldWorking)
     : claudeTranscriptTurnEnd.endedForMs(now);
