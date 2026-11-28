@@ -41,6 +41,8 @@ export interface BytedcliChildInvocation {
 export interface BytedcliChildResult { readonly stdout: Buffer; readonly stderr: Buffer; readonly exitCode: number }
 export type BytedcliChildRunner = (invocation: BytedcliChildInvocation) => Promise<BytedcliChildResult>;
 const networkKeys: ReadonlySet<string> = new Set(BYTEDCLI_HOST_NETWORK_KEYS);
+/** Helper discovery never inherits arbitrary daemon/workspace PATH entries. */
+export const BYTEDCLI_TRUSTED_HELPER_DIRECTORIES: readonly string[] = Object.freeze(['/usr/local/bin', '/usr/bin', '/bin']);
 export function bytedcliMinimalEnv(home: string, cwd: string, path: string, network: Readonly<NodeJS.ProcessEnv> = {}): NodeJS.ProcessEnv {
   if (!isAbsolute(home) || !isAbsolute(cwd) || !path.split(delimiter).every(dir => isAbsolute(dir) && resolve(dir) === dir)) {
     throw new BytedcliBrokerError('executor_unavailable');
@@ -114,8 +116,12 @@ export async function discoverBytedcliTrustedCli(options: {
   const runtime = realpathSync(options.runtimeExecutable);
   accessSync(runtime, constants.X_OK);
   if (!statSync(runtime).isFile() || !owned(runtime) || !owned(dirname(runtime))) throw new BytedcliBrokerError('executor_unavailable');
-  const path = [dirname(runtime), ...options.path.split(delimiter)].join(delimiter);
-  if (!path.split(delimiter).every(dir => isAbsolute(dir) && owned(realpathSync(dir)))) throw new BytedcliBrokerError('executor_unavailable');
+  let searchPath: string[];
+  try { searchPath = [...new Set(options.path.split(delimiter).map(dir => realpathSync(dir))
+    .filter(dir => BYTEDCLI_TRUSTED_HELPER_DIRECTORIES.includes(dir)))]; }
+  catch { throw new BytedcliBrokerError('executor_unavailable'); }
+  const path = [dirname(runtime), ...searchPath].join(delimiter);
+  if (!path.split(delimiter).every(dir => isAbsolute(dir) && resolve(dir) === dir && owned(dir))) throw new BytedcliBrokerError('executor_unavailable');
   for (const candidate of options.candidates) {
     let entrypoint: string; let installationRoot: string; let stillCurrent: () => boolean; let trees: ReturnType<typeof snapshotBytedcliRuntimeTrees>;
     try {
@@ -176,7 +182,7 @@ export async function discoverBytedcliTrustedCli(options: {
     if (result.exitCode !== 0 || !stillCurrent()) throw new BytedcliBrokerError('executor_unavailable');
     assertBytedcliAuditedRelease(result.stdout.toString().trim());
     return Object.freeze({ executable: runtime, prefixArgs: Object.freeze([entrypoint]), path, version: BYTEDCLI_AUDITED_RELEASE,
-      protectedPaths: Object.freeze([...trees!.protectedPaths, runtime, dirname(runtime)]), stillCurrent });
+      protectedPaths: Object.freeze([...new Set([...trees!.protectedPaths, runtime, dirname(runtime), ...searchPath])]), stillCurrent });
   }
   throw new BytedcliBrokerError('executor_unavailable');
 }

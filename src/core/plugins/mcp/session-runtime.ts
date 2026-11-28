@@ -8,7 +8,7 @@ import { sessionPluginManifestPath } from '../session-manifest.js';
 import type { PluginMcpServer } from '../types.js';
 import { isPluginMcpServer, readPluginMcpDescriptor } from './private-store.js';
 import { normalizeProtectedHttpEgressPolicy } from '../../protected-http-egress.js';
-import { approvedReadOnlyTools, parseHostReadOnlyMcpTools, type HostReadOnlyMcpTools } from './read-only-policy.js';
+import { approvedReadOnlyTools, assertHostReadOnlyMcpRuntimeTree, parseHostReadOnlyMcpTools, type HostReadOnlyMcpTools } from './read-only-policy.js';
 import {
   ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS,
   effectiveMcpGatewayMaxToolTimeoutMs,
@@ -102,6 +102,7 @@ export function refreshSessionMcpRuntimeManifest(opts: {
     if (readOnly && (server.transport !== 'stdio' || server.protectedCapability || server.protectedEgressPolicy)) {
       throw new Error(`host read-only MCP requires an unprotected local stdio server:${pluginId}`);
     }
+    if (readOnly) assertHostReadOnlyMcpRuntimeTree(pluginId, pluginRuntimeDir(pluginId));
     const runtime = opts.pluginRuntime?.[pluginId];
     if (runtime?.toolTimeoutMs !== undefined && runtime.toolTimeoutMs > maxToolTimeoutMs) {
       throw new Error(`plugin_mcp_tool_timeout_exceeds_max:${pluginId}:${runtime.toolTimeoutMs}:${maxToolTimeoutMs}`);

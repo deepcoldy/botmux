@@ -30,8 +30,8 @@ export function createBytedcliGdprLeaseResolver(machineFile?: string): NonNullab
       if (!Number.isSafeInteger(expiration)) throw new Error('invalid expiry');
       const expiresAt = expiration * 1000;
       if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now() + 60_000) throw new Error('expired');
-      const stillCurrent = async () => {
-        if (request.signal.aborted) return 'cancelled' as const;
+      const stillCurrent = async (signal = request.signal) => {
+        if (signal.aborted) return 'cancelled' as const;
         const code = await request.recheck(); if (code) return code;
         if (!snapshot.stillCurrent() || expiresAt <= Date.now() + 60_000) return 'region_auth_required' as const;
         return undefined;

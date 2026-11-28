@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -113,6 +113,20 @@ describe('strict sessions with host-approved read-only MCP tools', () => {
     await expect(c.callTool({ name: 'fixture_unique' })).rejects.toThrow();
     await expect(c.readResource({ uri: 'demo://shared' })).rejects.toThrow();
     await expect(c.getPrompt({ name: 'welcome' })).rejects.toThrow();
+  });
+  it('rejects linked runtimes when generating a strict snapshot', () => {
+    installLocalPlugin(join(home, 'reader'), { link: true });
+    expect(() => manifest()).toThrow(/frozen regular tree/);
+  });
+  it('rejects interior symlinks preserved by a copied install', () => {
+    symlinkSync('index.json', join(home, 'reader', 'dist', 'mcp', 'linked-descriptor.json'));
+    installLocalPlugin(join(home, 'reader'));
+    expect(() => manifest()).toThrow(/frozen regular tree/);
+  });
+  it('revalidates the runtime tree when a gateway starts from an earlier valid snapshot', async () => {
+    manifest();
+    installLocalPlugin(join(home, 'reader'), { link: true });
+    await expect(connect()).rejects.toThrow(/frozen regular tree/);
   });
   it('fails closed when the snapshot is missing or invalid instead of falling back to registry plugins', async () => {
     await expect(connect()).rejects.toThrow(/snapshot|manifest/i);

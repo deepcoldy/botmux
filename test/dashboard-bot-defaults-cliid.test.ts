@@ -117,7 +117,12 @@ describe('trigger-user credential sources', () => {
     const change = async (name: string, value: string) => act(async () => {
       control(name).props.onChange({ currentTarget: { value } });
     });
-    const savedSource = () => JSON.parse(String(request.mock.lastCall?.[1]?.body)).triggerUserAuth.credentialSource;
+    const savedSource = () => {
+      const puts = request.mock.calls.filter(([, init]) => init?.method === 'PUT');
+      const body = puts.at(-1)?.[1]?.body;
+      expect(body).toBeDefined();
+      return JSON.parse(String(body)).triggerUserAuth.credentialSource;
+    };
 
     expect(control('trigger-user-auth-source').props.value).toBe('platform');
     await change('trigger-user-auth-source', 'split');

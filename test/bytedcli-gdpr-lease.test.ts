@@ -12,6 +12,17 @@ it('protects the frozen GDPR machine file as credential, never executable', () =
   expect(layout.credentialRoots).toContain(file); expect(layout.executableReadOnlyRoots).not.toContain(file);
   expect((layout as any).gdprMachineFile).toBe(file);
 });
+it('uses the replay signal rather than the settled request signal when revalidating a lease',async()=>{
+ const {createBytedcliGdprLeaseResolver}=await import('../src/core/bytedcli-gdpr-lease.js');
+ const root=mkdtempSync(join(tmpdir(),'gdpr-replay-'));roots.push(root);const file=join(root,'gdpr');
+ const jwt='e30.'+Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+3600})).toString('base64url')+'.fixture';
+ writeFileSync(file,jwt,{mode:0o600});
+ const original=new AbortController(),resolve=createBytedcliGdprLeaseResolver(file);
+ const lease=await resolve('gdpr','machine',{region:'cn',signal:original.signal,recheck:async()=>undefined} as any);
+ original.abort();
+ expect(await lease.stillCurrent(new AbortController().signal)).toBeUndefined();
+ expect(await lease.stillCurrent()).toBe('cancelled');
+});
 it.each(['fresh','expired','string-expiry','public','hardlink','actor','changed'])('GDPR realm binds protected actual source and refuses unsafe %s',async mode=>{
  const {createBytedcliGdprLeaseResolver}=await import('../src/core/bytedcli-gdpr-lease.js');
  const root=mkdtempSync(join(tmpdir(),'gdpr-source-'));roots.push(root);const file=join(root,'gdpr');

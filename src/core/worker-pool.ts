@@ -2,6 +2,7 @@ import { canonicalPathNearest } from './cli-identity.js';
 import { freezeBytedcliHostLayout } from './bytedcli-host-layout.js';
 import { bytecloudExportBlocked, persistBytedcliStrictSession, bytedcliStrictMarkerRoot } from './bytedcli-strict-session.js';
 import { markBytedcliStrictSession, acceptBytedcliWorkerContainment } from './bytedcli-broker-containment.js';
+import { deferBytedcliWorkerRetirement } from './bytedcli-worker-retirement.js';
 import { NATIVE_GATEWAY_CORE_CREDENTIAL_ENV } from './native-gateway-credential.js';
 import { rememberCoreOnlyGoal, rememberCoreOnlyLimit } from './core-only-progress.js';
 import { ensureClaudeFolderTrust } from './claude-folder-trust.js';
@@ -1687,6 +1688,12 @@ export interface WorkerPoolCallbacks {
    * marked closed. Its in-memory queued work must be retired before any same-key
    * replacement can become ready. Notifications remain the callback's job. */
   onSessionRetired?: (ds: DaemonSession) => void;
+  /** A strict replacement must finish retiring this exact old broker generation
+   * before its deferred successor may spawn. */
+  onWorkerGenerationRetired?: (
+    session: Session,
+    context: { workerGeneration: number },
+  ) => void | Promise<void>;
   /** Runs only after closeSession has durably closed the row and the exact
    * worker-exit fence has proved that generation can no longer write. Narrow
    * XPI shared-cwd coordinator migration is performed here, never by a hot
@@ -21814,6 +21821,29 @@ export function forkWorker(
   }
 
   const bot = getBot(ds.larkAppId);
+  const previousGeneration = ds.workerGeneration;
+  const onWorkerGenerationRetired = requireCallbacks().onWorkerGenerationRetired;
+  if (deferBytedcliWorkerRetirement({
+    sessionId: ds.session.sessionId,
+    workerGeneration: previousGeneration,
+    strict: ds.session.bytecloudBrokerStrict === true || ds.initConfig?.bytedcliContainment !== undefined,
+    retire: onWorkerGenerationRetired && previousGeneration !== undefined
+      ? () => onWorkerGenerationRetired(ds.session, { workerGeneration: previousGeneration })
+      : undefined,
+    continue: () => {
+      if (findActiveBySessionId(ds.session.sessionId) === ds) forkWorker(ds, promptInput, resumeOrTurnId, opts);
+    },
+    fail: error => {
+      const reason = `ByteCloud broker generation retirement failed: ${error instanceof Error ? error.message : String(error)}`;
+      logger.error(`[${tag(ds)}] ${reason}`);
+      const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+      publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, bot.config), reason, turnId, dispatchAttempt, opts);
+      opts.onAdmission?.('rejected');
+    },
+  })) {
+    opts.onAdmission?.('deferred');
+    return true;
+  }
   if (ds.session.bytecloudBrokerStrict || bytecloudExportBlocked(config.session.dataDir, ds.session.sessionId, bot.config.triggerUserAuth)) {
     persistBytedcliStrictSession(config.session.dataDir, ds.session.sessionId);
     markBytedcliStrictSession(ds);

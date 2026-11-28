@@ -84,7 +84,7 @@ import {
 } from '../../protected-mcp-capabilities.js';
 import { ProtectedSecretClientTransport } from './protected-secret-transport.js';
 import { PROTECTED_HTTP_EGRESS_SOCKET_ENV } from '../../protected-http-egress-host.js';
-import { approvedReadOnlyTools, assertHostReadOnlyMcpRuntime, readOnlyMcpTurnKey, type HostReadOnlyMcpTools } from './read-only-policy.js';
+import { approvedReadOnlyTools, assertHostReadOnlyMcpRuntime, assertHostReadOnlyMcpRuntimeTree, readOnlyMcpTurnKey, type HostReadOnlyMcpTools } from './read-only-policy.js';
 
 const GATEWAY_VERSION = '1.0.0';
 const DOWNSTREAM_INITIALIZE_TIMEOUT_MS = 10_000;
@@ -277,6 +277,7 @@ function resolveGatewayRuntime(
     if (requestedPluginIds) throw new Error('host read-only MCP requires a session snapshot');
     const snapshot = env.BOTMUX_SESSION_ID ? readSessionMcpRuntimeManifest(env.BOTMUX_SESSION_ID, gatewayDataDir(env)) : null;
     assertHostReadOnlyMcpRuntime(snapshot, readOnly.tools);
+    for (const entry of snapshot!.entries) assertHostReadOnlyMcpRuntimeTree(entry.pluginId, entry.pluginDir);
     return { pluginIds: snapshot!.pluginIds, descriptors: snapshotGatewayDescriptors(snapshot!) };
   }
   if (!requestedPluginIds) {

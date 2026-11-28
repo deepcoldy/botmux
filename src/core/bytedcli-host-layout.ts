@@ -6,10 +6,10 @@ import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
 import { parseBytedcliMachineProfile } from './bytedcli-broker-credentials.js';
 import { snapshotBytedcliRuntimeTrees, snapshotBytedcliTrustedFiles } from './bytedcli-runtime-integrity.js';
 import { bytedcliHostNetworkEnvironment } from './bytedcli-host-network.js';
-import { discoverBytedcliDbRuntime } from './bytedcli-broker-process.js';
+import { BYTEDCLI_TRUSTED_HELPER_DIRECTORIES, discoverBytedcliDbRuntime } from './bytedcli-broker-process.js';
 import { pluginsHome, pluginRegistryPath } from './plugins/paths.js';
-/** Frozen once at host assembly. PATH is daemon startup configuration, never
- * Bot/Agent env, and discover validates canonical install/runtime ownership. */
+/** Frozen once at host assembly. Daemon PATH only discovers the CLI/runtime;
+ * helper execution uses canonical fixed system directories, never workspace entries. */
 export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {readonly protectedRoots?:readonly string[]}={}){
   // Resolve the operator's home alias before enforcing physical authority paths.
   const machineHome=realpathSync(homedir()),path=process.env.PATH??'/usr/local/bin:/usr/bin:/bin';
@@ -61,20 +61,23 @@ export function bytedcliTrustedHostLayout(settings:BytedcliBrokerConfig & {reado
     ...['BYTEDCLI_CONFIG_DIR','BYTEDCLI_HOME','BOTS_CONFIG','SSH_AUTH_SOCK','GIT_CONFIG_GLOBAL','GIT_CONFIG_SYSTEM'].flatMap(key=>process.env[key]&&isAbsolute(process.env[key]!)?[process.env[key]!]:[]),
     ...['AIME_WORKSPACE_PATH','AILY_WORKSPACE_PATH','AILY_WORKSPACE_DIR'].flatMap(key=>process.env[key]&&isAbsolute(process.env[key]!)?[process.env[key]!]:[]),
     ...(settings.protectedRoots??[])];
-  const executableReadOnlyRoots=[...(mcpRuntime?.protectedPaths ?? []),...installationRoots,...runtimeTrees.flatMap(tree=>tree.protectedPaths),...certificates.protectedPaths,...(dbRuntime?.protectedPaths ?? (isAbsolute(dbBinary) ? [dbBinary] : [])),...directories.filter(dir=>existsSync(join(dir,'bytedcli'))),...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
+  const executableReadOnlyRoots=[...(mcpRuntime?.protectedPaths ?? []),...installationRoots,...runtimeTrees.flatMap(tree=>tree.protectedPaths),...certificates.protectedPaths,...(dbRuntime?.protectedPaths ?? (isAbsolute(dbBinary) ? [dbBinary] : [])),
+    ...directories.flatMap(dir=>{try{const canonical=realpathSync(dir);return BYTEDCLI_TRUSTED_HELPER_DIRECTORIES.includes(canonical)?[canonical]:[];}catch{return [];}}),
+    ...directories.filter(dir=>existsSync(join(dir,'bytedcli'))),...directories.map(dir=>join(dir,'bytedcli')).filter(existsSync),
     runtimeExecutable,dirname(runtimeExecutable)];
   executableReadOnlyRoots.push(...(entrySnapshot?.protectedPaths ?? []));
-  const protectedRoots=[...credentialRoots,...executableReadOnlyRoots];
-  if(protectedRoots.some(root=>!isAbsolute(root)||root.startsWith('/$bunfs/')))throw new Error('invalid trusted protected root');
+  if([...credentialRoots,...executableReadOnlyRoots].some(root=>!isAbsolute(root)||root.startsWith('/$bunfs/')))throw new Error('invalid trusted protected root');
   const canonicalAliases=(paths:readonly string[])=>Object.freeze([...new Set(paths.flatMap(root=>{
     let ancestor=root;const suffix:string[]=[];
     while(!existsSync(ancestor)&&dirname(ancestor)!==ancestor){suffix.unshift(basename(ancestor));ancestor=dirname(ancestor);}
     try{return [root,join(realpathSync(ancestor),...suffix)];}catch{return [root];}
   }))]);
-  const aliases=canonicalAliases(protectedRoots);
+  const credentialRootAliases=canonicalAliases(credentialRoots);
+  const executableRootAliases=canonicalAliases(executableReadOnlyRoots).filter(path=>existsSync(path));
+  const aliases=canonicalAliases([...credentialRootAliases,...executableRootAliases]);
   return Object.freeze({machineHome,path,gdprMachineFile,candidates:Object.freeze(candidates),runtimeExecutable,dbRuntime,mcpRuntime,
-    installationRoots:Object.freeze(installationRoots),privateRoot,auditRoot,machineProfile:parseBytedcliMachineProfile(settings.machineProfile),credentialRoots:canonicalAliases(credentialRoots),
-    executableReadOnlyRoots:canonicalAliases(executableReadOnlyRoots),protectedRoots:aliases,networkEnv:Object.freeze(networkEnv),
+    installationRoots:Object.freeze(installationRoots),privateRoot,auditRoot,machineProfile:parseBytedcliMachineProfile(settings.machineProfile),credentialRoots:credentialRootAliases,
+    executableReadOnlyRoots:executableRootAliases,protectedRoots:aliases,networkEnv:Object.freeze(networkEnv),
     unavailableReason,
     runtimeStillCurrent:()=>!unavailableReason && runtimeProven && runtimeTrees.every(tree=>tree.stillCurrent()) && certificates.stillCurrent()
       && (!entrySnapshot || entrySnapshot.stillCurrent())});

@@ -57,6 +57,8 @@ export interface BotDefaultsSection {
   tile?: string;
   /** 区块里的配置项标题：⌘K 直达，落地时在区块里按文字定位到那一行。 */
   fieldKeys?: readonly string[];
+  /** 已被新模式替代、不再作为可见字段展示的旧深链名称；仍生成原 ⌘K 条目。 */
+  legacyFieldKeys?: readonly string[];
   /** 区块的其它叫法（i18n 键），只进 ⌘K 关键词，例如格子的无障碍名称与各分类里的小标题不同时。 */
   aliasKeys?: readonly string[];
 }
@@ -192,15 +194,16 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     'botDefaults.cliIdentityMode.machine',
     'botDefaults.cliIdentityMode.actor',
     'botDefaults.cliIdentityMode.mixed',
-    // Keep legacy field links pointing at this section.
-    'botDefaults.triggerUserAuthToggle',
-    'botDefaults.bytecloudExecution',
     'botDefaults.bytedcliPolicyTitle',
     'botDefaults.triggerUserAuthSource',
     'botDefaults.triggerUserAuthSourceDefault',
     'botDefaults.triggerUserAuthDelegateOnMention',
     'botDefaults.triggerUserAuthAllowSpeakerSwitch',
     'botDefaults.triggerUserAuthGitCommitIdentity',
+  ], legacyFieldKeys: [
+    // Keep legacy field links pointing at this section.
+    'botDefaults.triggerUserAuthToggle',
+    'botDefaults.bytecloudExecution',
   ] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle', 'botDefaults.larkUserOwnerFallbackToggle'] },
   { id: 'approval-compat', tab: 'security', titleKey: 'botDefaults.sectionApprovalCompat', fieldKeys: ['botDefaults.autoAvoidApprovalToggle'] },

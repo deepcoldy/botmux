@@ -16,6 +16,24 @@ describe('inheritSessionLaunchConfiguration', () => {
     expect(target.protectedResults).toBe(true);
   });
 
+  it('carries strict cold-start proof into native fork and clean recovery children', () => {
+    const source = {
+      sandbox: 'oncall', bytecloudBrokerStrict: true, bytecloudBrokerColdStart: true,
+    } as Session;
+    const fork = { cliSessionId: 'native-source' } as Session;
+    inheritSessionLaunchConfiguration(source, fork);
+    expect(fork.bytecloudBrokerStrict).toBe(true);
+    expect(fork.bytecloudBrokerColdStart).toBe(true);
+    const coldStartGuardRejects = !fork.bytecloudBrokerColdStart
+      && !!(fork.workerGeneration || fork.cliSessionId || fork.adoptedFrom);
+    expect(coldStartGuardRejects).toBe(false);
+
+    const recovery = {} as Session;
+    inheritSessionLaunchConfiguration(source, recovery);
+    expect(recovery.bytecloudBrokerStrict).toBe(true);
+    expect(recovery.bytecloudBrokerColdStart).toBe(true);
+  });
+
   it('does not synthesize protection on an ordinary session', () => {
     const target = {} as Session;
     inheritSessionLaunchConfiguration({ sandbox: 'oncall' } as Session, target);

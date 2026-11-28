@@ -37021,6 +37021,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         startReplacementRuntimeAfterReclaim(ds, true);
       }
     },
+    async onWorkerGenerationRetired(session, context) {
+      await bytedcliRetireSession?.(session.sessionId, context.workerGeneration);
+    },
     onSessionRetired(ds) {
       void cancelQueuedForks(ds, 'source_changed').catch(error =>
         logger.warn(`[${tag(ds)}] queued /fork cancellation failed: ${String(error)}`));

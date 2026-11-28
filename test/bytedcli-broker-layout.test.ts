@@ -1,5 +1,5 @@
 import {afterEach,expect,it,vi} from 'vitest';
-import {chmodSync,closeSync,existsSync,fsyncSync,linkSync,lstatSync,mkdtempSync,mkdirSync,openSync,readFileSync,symlinkSync,rmSync,writeFileSync,writeSync} from 'node:fs';
+import {chmodSync,closeSync,existsSync,fsyncSync,linkSync,lstatSync,mkdtempSync,mkdirSync,openSync,readFileSync,realpathSync,symlinkSync,rmSync,writeFileSync,writeSync} from 'node:fs';
 import {bytedcliMinimalEnv} from '../src/core/bytedcli-broker-process.js';
 import {snapshotBytedcliDbCodeCopy,snapshotBytedcliTrustedFiles} from '../src/core/bytedcli-runtime-integrity.js';
 import {createHash,randomUUID} from 'node:crypto';
@@ -72,6 +72,19 @@ it.each(['target-write','alias-replace'])('invalidates frozen certificate author
  if(mode==='target-write')writeFileSync(target,'replacement');
  else {rmSync(alias);const second=join(root,'second');writeFileSync(second,'second');symlinkSync(second,alias);}
  expect(layout.runtimeStillCurrent()).toBe(false);
+});
+it('omits absent executable mount leaves without weakening absent-root invalidation',()=>{
+ const root=mkdtempSync(join(tmpdir(),'broker-absent-mounts-'));roots.push(root);vi.stubEnv('HOME',root);vi.stubEnv('PATH',root);
+ const dist=join(root,'install/node_modules/@bytedance-dev/bytedcli/dist');mkdirSync(dist,{recursive:true});
+ const entry=join(dist,'bytedcli.js');writeFileSync(entry,'reviewed');
+ const layout=bytedcliTrustedHostLayout(parseBytedcliBrokerConfig({cliEntrypoint:entry}));
+ expect(layout.executableReadOnlyRoots.length).toBeGreaterThan(0);
+ expect(layout.executableReadOnlyRoots.every(path=>existsSync(path))).toBe(true);
+ expect(layout.executableReadOnlyRoots).not.toContain(realpathSync(root));
+ const missingDb=join(root,'.local/share/bytedcli/dependency/db/node_modules/@bytedance-dev/db-cli/bin/db-cli-linux-amd64');
+ expect(existsSync(missingDb)).toBe(false);expect(layout.executableReadOnlyRoots).not.toContain(missingDb);
+ const absentSearchRoot=join(dist,'node_modules');expect(layout.executableReadOnlyRoots).not.toContain(absentSearchRoot);
+ expect(layout.runtimeStillCurrent()).toBe(true);mkdirSync(absentSearchRoot);expect(layout.runtimeStillCurrent()).toBe(false);
 });
 it('protects canonical future/profile paths reached through a lexical alias',()=>{
  const root=mkdtempSync(join(tmpdir(),'broker-layout-'));roots.push(root);const actual=join(root,'actual'),alias=join(root,'alias');mkdirSync(actual);symlinkSync(actual,alias);

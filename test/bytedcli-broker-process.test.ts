@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { bytedcliMinimalEnv, discoverBytedcliTrustedCli, runBoundedBytedcliChild } from '../src/core/bytedcli-broker-process.js';
@@ -42,6 +42,28 @@ describe('private bounded CLI processes', () => {
     expect(cli.executable).toBe(node); expect(cli.prefixArgs).toEqual([entry]);
     expect(cli.path.split(':')[0]).toBe(dirname(node)); expect(cli.stillCurrent()).toBe(true);
     writeFileSync(entry, 'console.log("0.200.0")'); expect(cli.stillCurrent()).toBe(false);
+  });
+  it('uses only canonical fixed helper directories after a custom PATH alias is retargeted', async () => {
+    const root = setup(); const install = join(root, 'install'); mkdirSync(install, { recursive: true });
+    const entry = join(install, 'bytedcli.mjs'); writeFileSync(entry, 'console.log("0.199.0")');
+    const targetA = join(root, 'helpers-a'), targetB = join(root, 'helpers-b'), alias = join(root, 'helpers-link');
+    mkdirSync(targetA); mkdirSync(targetB); symlinkSync(targetA, alias);
+    const home = join(root, 'home'), cwd = join(root, 'cwd'); mkdirSync(home); mkdirSync(cwd);
+    const node = realpathSync(resolveNodeExecutable()!);
+    const cli = await discoverBytedcliTrustedCli({ candidates: [entry], installationRoots: [install], runtimeExecutable: node,
+      path: `${alias}:/usr/bin:/bin`, probeHome: home, probeCwd: cwd, signal: new AbortController().signal,
+      run: async invocation => invocation.argv[0] === entry
+        ? { stdout: Buffer.from('0.199.0'), stderr: Buffer.alloc(0), exitCode: 0 }
+        : { stdout: Buffer.from(JSON.stringify({ node: 'node', major: 22, bun: false, globalPaths: [] })), stderr: Buffer.alloc(0), exitCode: 0 } });
+    unlinkSync(alias); symlinkSync(targetB, alias);
+    expect(cli.path.split(':')).not.toContain(targetA);
+    expect(cli.path.split(':')).not.toContain(alias);
+    expect(cli.path.split(':')).not.toContain(targetB);
+    expect(cli.path.split(':')).toContain('/usr/bin');
+    expect(cli.protectedPaths).toContain('/usr/bin');
+    expect(cli.protectedPaths).not.toContain(targetA);
+    expect(cli.protectedPaths).not.toContain(targetB);
+    expect(cli.stillCurrent()).toBe(true);
   });
   it('refuses a runtime with a global module search path outside the frozen installation closure before invoking the CLI', async () => {
     const root = setup(); const entry = join(root, 'bytedcli.mjs'); writeFileSync(entry, 'console.log("0.199.0")');

@@ -5651,6 +5651,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionTriggerUserAuth')}</h3>
       <div className="bd-mode-opts-wrap">
+        <FieldTitle>{tr('botDefaults.cliIdentityMode')}</FieldTitle>
         <div className="bd-mode-opt-grid bd-cli-identity-modes" role="radiogroup"
           aria-label={tr('botDefaults.cliIdentityMode')} aria-describedby={`${policyTableId}-mode-help`}>
           {CLI_IDENTITY_MODES.map((option, index) => (
@@ -5666,7 +5667,8 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
               }}>
               <span className="bd-mode-opt-radio" aria-hidden="true" />
               <span className="bd-mode-opt-text">
-                <span className="bd-mode-opt-name">{tr(`botDefaults.cliIdentityMode.${option}`)}</span>
+                <span className="bd-mode-opt-name">{option === 'machine' ? tr('botDefaults.cliIdentityMode.machine')
+                  : option === 'actor' ? tr('botDefaults.cliIdentityMode.actor') : tr('botDefaults.cliIdentityMode.mixed')}</span>
                 <span className="bd-mode-opt-short">{tr(`botDefaults.cliIdentityModeShort.${option}`)}</span>
               </span>
             </button>
@@ -5764,7 +5766,7 @@ export function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: P
         </>
       ) : null}
       {strict ? <div data-action="bytedcli-policy-table">
-        <h4>{tr('botDefaults.bytedcliPolicyTitle')}</h4>
+        <h4 className="bd-subsection-title">{tr('botDefaults.bytedcliPolicyTitle')}</h4>
         <p className="bd-section-note" data-action="trigger-user-auth-bytecloud-restrictions">{tr('botDefaults.bytecloudExecutionRestrictions')}</p>
         <p className="bd-section-note" data-action="bytedcli-policy-state" data-state={policyState}>
           {tr(`botDefaults.bytedcliPolicyState.${policyState}`)}
