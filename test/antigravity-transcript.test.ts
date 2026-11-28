@@ -204,6 +204,24 @@ describe('drainAntigravityTranscript', () => {
     expect(r.state.provisionalFinal?.text).toBe('答案二');
   });
 
+  it('quiet confirmation cannot flush a newer candidate written during the viewport probe', () => {
+    writeFileSync(path, line(userRecord('跑构建')) + line(plannerStep({ content: '第一段', step: 1 })));
+    const first = drainAntigravityTranscript(path, 0);
+    const candidate = first.state.provisionalFinal!;
+    const expectedTrailingFinal = { uuid: candidate.uuid, offset: first.newOffset };
+    appendFileSync(path, line(plannerStep({ content: '第二段', step: 2 })));
+    const changed = drainAntigravityTranscript(path, first.newOffset, first.state, {
+      flushTrailingFinal: true, expectedTrailingFinal,
+    });
+    expect(changed.events).toEqual([]);
+    expect(changed.state.provisionalFinal?.text).toBe('第二段');
+    const next = drainAntigravityTranscript(path, changed.newOffset, changed.state, {
+      flushTrailingFinal: true,
+      expectedTrailingFinal: { uuid: changed.state.provisionalFinal!.uuid, offset: changed.newOffset },
+    });
+    expect(next.events).toMatchObject([{ kind: 'assistant_final', text: '第二段' }]);
+  });
+
   it('cancels a held candidate when the planner wakes and runs more tools (background-task shape)', () => {
     writeFileSync(path, [
       line(userRecord('跑下构建')),

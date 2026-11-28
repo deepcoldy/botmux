@@ -37,6 +37,8 @@ import {
 } from '../src/services/codex-bridge-queue.js';
 import { IdleDetector, type ProgramStatusEvent } from '../src/utils/idle-detector.js';
 import { ProgramStatusFramingStream } from '../src/utils/program-status-parser.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { busyProbeRegion } from '../src/utils/busy-probe.js';
 
 const osc = (fields: string) => `\x1b]7501;${fields}\x07`;
 const b64 = (text: string) => Buffer.from(text, 'utf8').toString('base64');
@@ -464,6 +466,83 @@ describe('OSC 7501 busy-driven bounded pre-start lease refresh (Antigravity)', (
       expect(queue.drainEmittable().map(t => ({ turnId: t.turnId, finalText: t.finalText }))).toEqual([
         { turnId: 'om_cold', finalText: 'cold start reply' },
       ]);
+    }
+  });
+
+  it('uses the real worker viewport hook without OSC, then enforces the same hard ceiling', () => {
+    let now = 0;
+    const queue = new CodexBridgeQueue(() => now);
+    queue.mark('om_cold', 'cold start prompt', 0);
+    queue.confirmPendingTurn('om_cold', 0);
+    const scope: Record<string, any> = {
+      structuredBridgeIs: (id: string) => id === 'antigravity',
+      lastInitConfig: { cliId: 'antigravity', adoptMode: false },
+      cliAdapter: createAntigravityAdapter(),
+      backend: {},
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      captureBackendScreen: () => 'Working…\nesc to cancel',
+      busyProbeRegion,
+      codexBridgeQueue: queue,
+      refreshStructuredPreStartLeaseFromProgramStatus,
+      ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS,
+    };
+    const hold = loadWorkerFunction<() => void>('holdStructuredStartLeasesWhileAntigravityViewportBusy', scope);
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+
+    // No OSC report arrives at all. The visible busy footer keeps the exact
+    // owner attributable until its late transcript user/final pair appears.
+    for (now = 1_000; now <= 45_000; now += 1_000) {
+      hold();
+      expect(queue.pruneExpiredPreStartHeads(now)).toEqual([]);
+    }
+    now = 46_000;
+    queue.ingest([
+      { kind: 'user', text: 'cold start prompt', uuid: 'u-no-osc', timestampMs: 46_000 },
+      { kind: 'assistant_final', text: 'late reply', uuid: 'a-no-osc', timestampMs: 46_100 },
+    ]);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_cold', finalText: 'late reply' }]);
+
+    // A permanently stuck footer cannot refresh forever: after the 120s cap,
+    // only the ordinary final 20s grace remains.
+    const stuck = new CodexBridgeQueue(() => now);
+    stuck.mark('om_stuck_viewport', 'stuck prompt', 0);
+    stuck.confirmPendingTurn('om_stuck_viewport', 0);
+    scope.codexBridgeQueue = stuck;
+    now = 0;
+    for (now = 1_000; now <= ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS; now += 1_000) {
+      hold();
+      expect(stuck.pruneExpiredPreStartHeads(now)).toEqual([]);
+    }
+    now = ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS + 1_000;
+    hold();
+    expect(stuck.pruneExpiredPreStartHeads(now)).toEqual([]);
+    now = ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS + STRUCTURED_SUBMIT_START_GRACE_MS;
+    expect(stuck.pruneExpiredPreStartHeads(now)).toEqual([]);
+    now += 1;
+    expect(stuck.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['om_stuck_viewport']);
+  });
+
+  it('does not probe or renew from a busy viewport for adopt or framed ACP', () => {
+    for (const opts of [{ adopt: true, acp: false }, { adopt: false, acp: true }]) {
+      const queue = new CodexBridgeQueue(() => 0);
+      queue.mark('om_excluded', 'prompt', 0);
+      queue.confirmPendingTurn('om_excluded', 0);
+      const capture = vi.fn(() => 'Working…\nesc to cancel');
+      const scope: Record<string, any> = {
+        structuredBridgeIs: (id: string) => id === 'antigravity',
+        lastInitConfig: { cliId: 'antigravity', adoptMode: opts.adopt },
+        cliAdapter: opts.acp ? createAntigravityAcpAdapter() : createAntigravityAdapter(),
+        backend: {},
+        backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+        captureBackendScreen: capture,
+        busyProbeRegion,
+        codexBridgeQueue: queue,
+        refreshStructuredPreStartLeaseFromProgramStatus,
+        ANTIGRAVITY_PROGRAM_STATUS_BUSY_REFRESH_MAX_MS,
+      };
+      loadWorkerFunction<() => void>('holdStructuredStartLeasesWhileAntigravityViewportBusy', scope)();
+      expect(capture).not.toHaveBeenCalled();
+      expect(queue.peek()[0]?.submitConfirmedAtMs).toBe(0);
     }
   });
 

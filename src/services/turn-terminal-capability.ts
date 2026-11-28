@@ -1,5 +1,6 @@
 import { isCodexAppCliId, type CliAdapter } from '../adapters/cli/types.js';
 import type { BackendType } from '../adapters/backend/types.js';
+import { isRemoteBackendId } from '../core/remote-cli-ids.js';
 import { isStructuredBridgeFallbackActive } from './structured-bridge-clis.js';
 
 export type TurnTerminalAdapter = Pick<CliAdapter, 'claudeDataDir' | 'runnerFramedInput'>;
@@ -25,13 +26,20 @@ export function hasAppRunnerOscControlChannel(cliId: string | undefined, adapter
     || (cliId === 'antigravity' && adapter?.runnerFramedInput === true);
 }
 
-/** Runtime exceptions to the static structured-bridge list. A framed
- * Antigravity ACP runner has no terminal transcript to harvest. Cursor's
- * scratch full-root COW hides its transcript mirror from the host reader, so
- * only an unsandboxed adopt may retain that bridge. Sharing this predicate
- * keeps worker bridge activation and daemon idle-UI decisions in lockstep. */
+/** Keep worker bridge activation and daemon idle-UI decisions in lockstep.
+ * ACP frames provide their own terminal. A scratch COW sandbox hides local
+ * transcript mirrors from the host reader. */
 export function hasStructuredBridgeTurnTerminal(opts: TurnTerminalCapabilityOptions): boolean {
-  if (opts.cliId === 'antigravity' && opts.adapter?.runnerFramedInput === true) return false;
+  if (opts.cliId === 'antigravity') {
+    if (opts.adapter?.runnerFramedInput === true) return false;
+    if (opts.adoptMode === true) return true;
+    // Final records can arrive while agy is waiting on a background task. The
+    // bridge confirms the local ready viewport before forwarding its answer.
+    if (opts.scratch === true || opts.backendType === 'zmx' || opts.backendType === 'orca') return false;
+    // Use the same transcript fallback as adopt and zero-prompt turns. The
+    // bridge's send-marker gate still owns deduplication for explicit sends.
+    if (opts.backendType !== undefined) return !isRemoteBackendId(opts.backendType);
+  }
   if (opts.cliId === 'cursor' && opts.adoptMode !== true && opts.scratch === true) return false;
   return isStructuredBridgeFallbackActive(opts.cliId, opts.adoptMode, opts.zeroPrompt);
 }
