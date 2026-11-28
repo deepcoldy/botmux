@@ -111,6 +111,8 @@ Bot 使用同一种版本化对象，例如：
 
 bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升依赖及软链的规范目标，宿主启动时冻结完整文件树，并在探测与执行时核验。Node 标准 runtime-prefix `lib/node` 全局搜索树同样受保护；探测到其他无法由冻结边界覆盖的全局搜索路径时拒绝。私有空 HOME 中的搜索目录无需读取宿主 HOME。外部软链指向工作区时，该依赖和可替换它的祖先也受保护；该工作区不能同时允许修改这段依赖。遍历超过 100,000 个节点、硬链接、特殊文件、断链或不安全权限的安装无法证明完整性，严格执行拒绝；普通旧模式仍可装配。管理员改变安装或证书后应重建严格会话。
 
+CLI/runtime 仍可经 daemon PATH 发现，但业务子进程的 helper 搜索只使用 `/usr/local/bin`、`/usr/bin`、`/bin` 的 canonical 路径。自定义 PATH 项、工作区 bin 目录和可被重定向的软链不会进入执行环境；缺失的可选运行时/DB 挂载 leaf 不生成无效 bind，其 absent→created 完整性围栏仍保留。
+
 网络只继承宿主冻结的 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 及对应小写变量。审核版本的原生传输不支持 `ALL_PROXY`/`all_proxy`；配置这些变量会明确标记严格宿主不可用，须改成所支持的 HTTP(S) 代理后重建，不能静默忽略路由。`NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 的规范路径、软链目标及祖先同样受保护并核验；无法证明的证书布局拒绝严格执行。以上限制不改变其他 CLI 或旧身份模式的网络合同。
 
 严格包装器不导出 ByteCloud token；独立 `codebase` / `bitscli` / `bits-cli`、git askpass 和 `BOTMUX_AS` 拒绝。独立 Meego、Lark 和旧模式保留原有合同；严格 bytedcli 中未登记的 Meego 等业务命令可进入下述 unknown/actor 隔离路径，仍须通过身份、参数和执行边界检查。
@@ -131,7 +133,7 @@ bytedcli 的只读边界包括祖先 `node_modules` 搜索路径、兄弟/提升
 
 只允许精确名称，不支持通配符、空工具名单、重复工具或自动相信 MCP 的 `readOnlyHint`。名单中的插件还必须在 Bot 上启用。新增授权需要重启 daemon 并冷启动会话；移除授权或禁用插件后，既有工具调用在请求和结果释放时重新检查，拒绝已撤销的查询。与 `machineProfile`、`cliEntrypoint` 合并配置，保留已有值。
 
-管理员必须先审核工具的完整行为：它应当使用固定机器身份、固定只读接口和严格参数校验，不能接受任意 URL、请求头、SQL 写入或通用命令，也不能把写接口以“查询”命名放入名单。本能力只支持普通本地 stdio MCP，拒绝 protected capability / protected egress 插件和远程 MCP。
+管理员必须先审核工具的完整行为：它应当使用固定机器身份、固定只读接口和严格参数校验，不能接受任意 URL、请求头、SQL 写入或通用命令，也不能把写接口以“查询”命名放入名单。本能力只支持普通本地 stdio MCP，拒绝 protected capability / protected egress 插件和远程 MCP。严格模式还只接受插件 Home 内的常规文件树：`--link` 安装、运行树内部软链及特殊文件均拒绝；即使 manifest 已生成，Gateway 启动前也会重新检查被替换的运行树。
 
 Gateway 只导出被批准的工具，并保持插件配置、Cookie、token 和浏览器 profile 对沙箱不可读、不可写。资源、提示词、反向 sampling/elicitation/roots、宿主结果投递及下游日志/progress 转发不开放。读取只绑定宿主当前执行轮次；定时任务不需要虚构真人触发者，上一轮的延迟结果不能释放到下一轮。此授权与 ByteCLI 命令身份规则相互独立，不改变未登记 ByteCLI 命令使用触发者的规则。
 
