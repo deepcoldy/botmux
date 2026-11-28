@@ -750,6 +750,42 @@ function directHumanHarness() {
   return h;
 }
 
+describe('checkpoint creation after a trigger yields to a real inbound turn', () => {
+  it('keeps the trigger refused and persists the checkpoint under the independent human turn', async () => {
+    const previousDataDir = config.session.dataDir;
+    const dataDir = join(mkdtempSync(join(tmpdir(), 'botmux-sched-real-inbound-')), 'data');
+    config.session.dataDir = dataDir;
+    scheduleStore.setScheduleScope('cli_target');
+    const store = ScheduleAuthorityStore.open(dataDir);
+    try {
+      store.initializeApp('cli_target', []);
+      realScheduler.setScheduleAuthorityStore(store);
+      const h = directHumanHarness();
+      h.scope.scheduleAuthorityStore = store;
+      h.scope.scheduler = { parseSchedule, addTask: realScheduler.addTask };
+      h.ds.session.replyTargets.trg_retry = { ...h.ds.session.replyTargets.om_kickoff };
+      h.ds.managedTurnOrigin.turnId = h.body.originTurnId = 'trg_retry';
+      expect(await h.run()).toMatchObject({ status: 403 });
+      expect(store.getRecord('cli_target', h.body.task.id)).toBeUndefined();
+
+      h.ds.managedTurnOrigin.turnId = h.body.originTurnId = 'om_kickoff';
+      const created = await h.run();
+      expect(created).toMatchObject({ status: 201 });
+      const taskId = (created.value as { task: { id: string } }).task.id;
+      expect(store.getRecord('cli_target', taskId)).toMatchObject({
+        kind: 'direct', state: 'active', targetTurnId: 'om_kickoff', controlOpenId: 'ou_user_target',
+        task: { creatorLarkAppId: 'cli_target', creatorChatId: 'oc_chat', ownerOpenId: 'ou_user_target' },
+      });
+    } finally {
+      realScheduler.stopScheduler();
+      realScheduler.setScheduleAuthorityStore(null);
+      store.close();
+      config.session.dataDir = previousDataDir;
+      rmSync(join(dataDir, '..'), { recursive: true, force: true });
+    }
+  });
+});
+
 describe('assistant-mode schedule creation', () => {
   it('lets the assistant owner who is also an administrator create on the ordinary path', async () => {
     const owner = directHumanHarness();

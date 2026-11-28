@@ -75,6 +75,33 @@ describe('resolveCurrentTurnProvenance', () => {
     }));
   }
 
+  it.each([false, true])('never authorizes a trigger from queued human input (consumed=%s)', consumed => {
+    const trigger = 'trg_model_retry';
+    const human = 'om_checkpoint';
+    writeMarker('sess-1', trigger);
+    const procStart = readProcessStartIdentity(process.pid);
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+      sessionId: 'sess-1', turnId: trigger, procStart,
+      queuedTurns: [{ turnId: human, ...(consumed ? { inputConsumed: true } : {}) }],
+    }));
+    writeSession({
+      quoteTargetId: human, quoteTargetSenderOpenId: 'ou_caller_b', quoteTargetSenderIsBot: false,
+      currentReplyTarget: { turnId: human, rootMessageId: 'om_real_root' },
+      replyTargets: {
+        [human]: { senderOpenId: 'ou_caller_b', participants: [{ openId: 'ou_caller_b', isBot: false }] },
+      },
+    });
+    expect(() => resolveCurrentTurnProvenance({ dataDir, startPid: process.pid }))
+      .toThrow(`进程标记 turn ${trigger} 与 session 当前 quote turn ${human} 不一致`);
+    // Only an independent human turn owns the marker and authenticates the
+    // existing schedule path; a consumed reply address above is insufficient.
+    writeMarker('sess-1', human);
+    expect(resolveCurrentTurnProvenance({ dataDir, startPid: process.pid })).toMatchObject({
+      turnId: human, callerOpenId: 'ou_caller_b', callerProvenHuman: true,
+      rootMessageId: 'om_real_root',
+    });
+  });
+
   it('authenticates the current caller, not the static session owner', () => {
     writeMarker('sess-1', 'turn-current');
     writeSession();

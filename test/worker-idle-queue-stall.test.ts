@@ -2,7 +2,7 @@ import { admitScheduledInput } from '../src/core/scheduled-input-admission.js';
 import { describe, expect, it, vi } from 'vitest';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
-import { pendingInputAllowsTypeAhead, pendingInputMayFlush, promoteInteractiveInputPastSchedules } from '../src/utils/pending-input-queue.js';
+import { inputForcesSerialTurn, pendingInputAllowsTypeAhead, pendingInputMayFlush, promoteInteractiveInputPastSchedules } from '../src/utils/pending-input-queue.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { AsyncSerialQueue } from '../src/utils/async-serial-queue.js';
@@ -47,7 +47,7 @@ function harness(cliId = 'codex') {
     shouldDeferUserFlush: () => false,
     refreshHookReviewInputHold: () => {},
     hookReviewHoldsQueuedWrite: () => false,
-    pendingInputMayFlush, pendingInputAllowsTypeAhead, promoteInteractiveInputPastSchedules, programStatusBlockHoldsTypeAhead,
+    inputForcesSerialTurn, pendingInputMayFlush, pendingInputAllowsTypeAhead, promoteInteractiveInputPastSchedules, programStatusBlockHoldsTypeAhead,
 
     rpcLifecycleFailClosedOwners: new Set(),
     probeStartupBlocker: () => false,
@@ -71,6 +71,55 @@ function harness(cliId = 'codex') {
 }
 
 describe('scheduled queue heads do not swallow human input', () => {
+  it('retains an adopted real input on repeated stale ready edges until the trigger ends', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = harness('traex');
+      const human = { ...h.pendingMessages[1], turnId: 'om_checkpoint', queueAfterActiveTurn: true };
+      h.lastInitConfig.adoptMode = true;
+      h.pendingMessages = [];
+      h.pendingAdoptMessages = [human];
+      h.hasPendingInputForFlush = () => h.pendingAdoptMessages.length > 0;
+      h.activeTurnAuthority.clear();
+      h.activeTurnAuthority.reserve({ turnId: 'trg_model_retry', caller: human.trustedCaller });
+      h.activeTurnAuthority.markStarted({ turnId: 'trg_model_retry', caller: human.trustedCaller });
+      h.runAdoptMessageForCapturedGeneration = vi.fn(async () => 'completed');
+      for (let tick = 0; tick < 2; tick++) {
+        h.isPromptReady = true;
+        await h.flushPending();
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(h.pendingAdoptMessages).toEqual([human]);
+        expect(h.runAdoptMessageForCapturedGeneration).not.toHaveBeenCalled();
+        expect(h.beginCliWriteCycle).not.toHaveBeenCalled();
+      }
+      h.activeTurnAuthority.clear();
+      h.isPromptReady = true;
+      await h.flushPending();
+      expect(h.pendingAdoptMessages).toEqual([]);
+      expect(h.runAdoptMessageForCapturedGeneration).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['traex', 'claude-code'])('keeps a real %s input behind a trigger until its authority ends', async cli => {
+    const h = harness(cli);
+    const human = { ...h.pendingMessages[1], turnId: 'om_checkpoint' };
+    h.pendingMessages = [human];
+    h.activeTurnAuthority.clear();
+    h.activeTurnAuthority.reserve({ turnId: 'trg_model_retry', caller: human.trustedCaller });
+    h.activeTurnAuthority.markStarted({ turnId: 'trg_model_retry', caller: human.trustedCaller });
+    // Even a stale ready frame must not fold the message into an active trigger.
+    h.freshnessInputQueue = { takeNormal: vi.fn(() => { h.pendingMessages.shift(); return undefined; }) };
+    await h.flushPending();
+    expect(h.pendingMessages).toEqual([human]);
+    expect(h.freshnessInputQueue.takeNormal).not.toHaveBeenCalled();
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('trg_model_retry');
+    h.activeTurnAuthority.clear();
+    h.isPromptReady = true;
+    await h.flushPending();
+    expect(h.freshnessInputQueue.takeNormal).toHaveBeenCalledOnce();
+    expect(h.pendingMessages).toEqual([]);
+  });
+
   it.each(['codex', 'claude-code'])('admits the controlling human past a blocked %s schedule, retaining authority and schedule', async cli => {
     const h = harness(cli);
     const oldAuthority = h.activeTurnAuthority.snapshot();
