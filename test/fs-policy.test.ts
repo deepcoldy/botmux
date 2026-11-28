@@ -2058,6 +2058,18 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
     expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config.json').access).toBe('deny');
     expect(p.rules.some(r => r.path === `${dataDir}/cli-identity`)).toBe(false);
   });
+  it('allows headless broker command files while denying old credentials and sibling identities', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false, larkToolIdentityEnabled: true, bytedcliBrokerEnabled: true }));
+    const identity = `${dataDir}/cli-identity/sess-mine.bin`;
+    for (const command of ['bytedcli','codebase','bitscli','bits-cli']) {
+      expect(accessForPath(p.rules, `${identity}/${command}`).access).toBe('readOnly');
+      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/${command}`).access).toBe('deny');
+    }
+    for (const file of ['bytedcli.env','codebase.env','bitscli.env','turn']) {
+      expect(accessForPath(p.rules, `${identity}/.data/${file}`).access).toBe('deny');
+    }
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin`).access).toBe('deny');
+  });
 });
 
 // sandbox=true × `botmux skill list/show/read/resources`: the reader needs THIS

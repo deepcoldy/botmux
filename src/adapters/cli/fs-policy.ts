@@ -200,6 +200,8 @@ export interface FsPolicyContext {
   /** Worker-verified managed tool binding. Grants only this session's read-only
    * wrapper/binding subtree; never the bot keystore or chat transport. */
   larkToolIdentityEnabled?: boolean;
+  /** Host-proven cold ByteCLI broker: command code only, even without IM transport. */
+  bytedcliBrokerEnabled?: boolean;
   /** The SECOND botmux root to deny (transport sessions: as the botmux-root
    *  ceiling; no-transport: as an authority root), when the
    *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
@@ -1044,6 +1046,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     // expose legacy user env/delegation files that may share this identity dir.
     push([`${identity}/lark-cli`, `${identity}/shell`,
       `${identity}/.data/lark-tool-binding.json`, `${identity}/.data/lark-config`], 'readOnly', 'internal');
+  }
+  if (ctx.sessionId && !larkTransport && ctx.bytedcliBrokerEnabled === true) {
+    const identity = `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`;
+    // These frozen wrappers carry routing hints only. Grant individual files:
+    // a legacy identity directory may still contain private user env files.
+    push(['bytedcli','codebase','bitscli','bits-cli'].map(command => `${identity}/${command}`), 'readOnly', 'internal');
   }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.

@@ -40765,6 +40765,7 @@ async function spawnCliBody(
       // grant can't re-expose them, and independently withholds the role-library grant.
       larkTransportEnabled,
       larkToolIdentityEnabled: boundLark,
+      bytedcliBrokerEnabled: !!cfg.bytedcliContainment,
       // ALWAYS freeze BOTH botmux authority roots for a no-transport turn: the
       // configured one (`botmuxHome` above = dirname(dataDir)) AND the canonical
       // default `~/.botmux`. A custom SESSION_DATA_DIR moves the data dir, but the

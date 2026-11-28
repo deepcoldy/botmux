@@ -18,6 +18,7 @@ try {
   const {parseBytedcliOperation}=await import(repo+'/src/core/bytedcli-operation-policy.ts');
   const {buildFsPolicy}=await import(repo+'/src/adapters/cli/fs-policy.ts');
   const {prepareDirectSandbox}=await import(repo+'/src/adapters/backend/sandbox.ts');
+  const {renderIdentityWrapper}=await import(repo+'/src/core/cli-identity.ts');
   const {observeBytedcliLinuxContainment}=await import(repo+'/src/core/bytedcli-linux-containment.ts');
   const workspace=join(root,'workspace'),pkg=join(root,'install/node_modules/@bytedance-dev/bytedcli'),dep=join(workspace,'review-helper');
   const bin=join(root,'bin'),entry=join(pkg,'dist/cli.mjs'),marker=join(workspace,'fake-token-leak'),certificate=join(workspace,'host-ca.pem');
@@ -40,15 +41,26 @@ try {
   const layout=bytedcliTrustedHostLayout(mode==='dedicated-installation'?{cliEntrypoint:entry}:{});
   process.env.PATH=savedPath;if(savedCert===undefined)delete process.env.NODE_EXTRA_CA_CERTS;else process.env.NODE_EXTRA_CA_CERTS=savedCert;
   const cli=await discoverBytedcliTrustedCli({...layout,probeHome:join(root,'probe-home'),probeCwd:join(root,'probe-cwd'),signal:new AbortController().signal});
+  const identity=join(root,'data/cli-identity/s.bin');
+  if(mode==='headless-wrapper'){
+    fs.mkdirSync(join(identity,'.data'),{recursive:true});
+    fs.writeFileSync(join(identity,'bytedcli'),renderIdentityWrapper('bytedcli','/usr/bin/false','proven',undefined,{brokerClient:['/usr/bin/false']}),{mode:0o755});
+    fs.writeFileSync(join(identity,'.data/bytedcli.env'),'FAKE_PRIVATE_CREDENTIAL');
+  }
   const policy=buildFsPolicy({platform:'linux',homeDir:root,botmuxHome:join(root,'.botmux'),sessionDataDir:join(root,'data'),workingDir:workspace,botHome:join(root,'.botmux/bots/app'),sessionId:'s',currentAppId:'app',redirectedCliData:true,
+    ...(mode==='headless-wrapper'?{larkTransportEnabled:false,bytedcliBrokerEnabled:true}:{}),
     protectedDenyPaths:layout.credentialRoots,protectedReadOnlyPaths:layout.executableReadOnlyRoots,userPaths:{readWrite:[workspace,...(mode==='certificate'?[certificate]:[])]}});
   policy.rules=policy.rules.filter(rule=>rule.access==='deny'||fs.existsSync(rule.path));
   const malicious=`import {readFileSync,writeFileSync} from 'node:fs';export default function run(){const p=process.argv[process.argv.indexOf('--bytecloud-user-jwt-file')+1];writeFileSync(${JSON.stringify(marker)},readFileSync(p));console.log('modified-dependency-ran');}`;
   const payload=Buffer.from(mode==='certificate'?'replacement-fake-cert':malicious).toString('base64');
   const target=mode==='certificate'?certificate:join(dep,'index.mjs');
-  const sandbox=prepareDirectSandbox({sessionId:'s',dataDir:join(root,'data'),policy,home:root,chdir:workspace,bytedcliBroker:true,cliBin:'/usr/bin/sh',cliArgs:['-c',`echo READY; read answer; printf '%s' '${payload}' | base64 -d > '${target}'; echo MUTATED; read answer`]});
+  const command=mode==='headless-wrapper'
+    ? `echo READY; read answer; command -v bytedcli; bytedcli --botmux-skill-api-contract; if cat '${identity}/.data/bytedcli.env' >/dev/null 2>&1; then echo CREDENTIAL_VISIBLE; fi; echo MUTATED; read answer`
+    : `echo READY; read answer; printf '%s' '${payload}' | base64 -d > '${target}'; echo MUTATED; read answer`;
+  const sandbox=prepareDirectSandbox({sessionId:'s',dataDir:join(root,'data'),policy,home:root,chdir:workspace,bytedcliBroker:true,
+    effectivePath:`${identity}:${bin}:/usr/bin:/bin`,identityBin:identity,cliBin:'/usr/bin/sh',cliArgs:['-c',command]});
   assert(sandbox);
-  const child=spawn(sandbox.bin,sandbox.args,{env:{PATH:'/usr/bin:/bin',HOME:root,...sandbox.env},stdio:['pipe','pipe','pipe']});
+  const child=spawn(sandbox.bin,sandbox.args,{env:{PATH:`${identity}:${bin}:/usr/bin:/bin`,HOME:root,...sandbox.env},stdio:['pipe','pipe','pipe']});
   let stdout='',stderr='';child.stdout!.on('data',b=>stdout+=b);child.stderr!.on('data',b=>stderr+=b);
   const waitFor=async(text:string)=>{const end=Date.now()+5000;while(!stdout.includes(text)&&child.exitCode===null&&Date.now()<end)await new Promise(r=>setTimeout(r,10));assert(stdout.includes(text),stdout+'\n'+stderr);};
   const descendants=(pid:number):number[]=>{let children:number[]=[];try{children=fs.readFileSync(`/proc/${pid}/task/${pid}/children`,'utf8').trim().split(/\s+/).filter(Boolean).map(Number);}catch{}return children.flatMap(id=>[id,...descendants(id)]);};
@@ -59,7 +71,11 @@ try {
     child.stdin!.write('go\n');await waitFor('MUTATED');
     assert.equal(cli.stillCurrent(),true);
     const acceptedAfterMutation=!!observeBytedcliLinuxContainment(cliPid,contract);assert(acceptedAfterMutation);
-    if(mode!=='certificate'){
+    if(mode==='headless-wrapper'){
+      assert(stdout.includes('botmux.skill-api.v1'),stdout+'\n'+stderr);
+      assert(!stdout.includes('CREDENTIAL_VISIBLE'),'headless broker exposed a legacy private env file');
+      log({mode,wrapperContractAvailable:true,legacyCredentialVisible:false});
+    }else if(mode!=='certificate'){
       const fakeJwt='FAKE_REVIEW_TOKEN_ONLY';
       const authority:any={daemonBootId:'boot',botAppId:'app',sessionId:'s',turnId:'A',identityTurnId:'A',workerGeneration:1,dispatchAttempt:0,policyFingerprint:'policy',actor:{verifiedEmail:'a@example.test',credentialOpenId:'ou_A',source:'local'},recheck:async()=>undefined};
       const executor=new BytedcliExecutor({privateRoot:join(root,'private'),audit:new BytedcliBrokerAudit(join(root,'audit')),trustedCli:async()=>cli,
