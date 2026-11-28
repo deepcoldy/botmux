@@ -22,6 +22,19 @@ const CLOSE_REQUEST_TIMEOUT_MS = 6_000;
 // `setsid()` bash tool children before we SIGTERM the ACP process group.
 const CANCEL_GRACE_TIMEOUT_MS = 1_500;
 const GRACEFUL_EXIT_TIMEOUT_MS = 1_500;
+// Bounded cross-process lease-contention retry window on session/resume|load.
+// Covers an overlapping retiring runner's graceful teardown ceiling
+// (CLOSE_REQUEST_TIMEOUT_MS + GRACEFUL_EXIT_TIMEOUT_MS + SIGKILL escalation)
+// when worker PTY restart respawns after 500ms, while still failing closed if
+// another process holds the session indefinitely.
+const RESUME_LEASE_WAIT_MS = 9_000;
+const RESUME_LEASE_RETRY_INITIAL_MS = 100;
+const RESUME_LEASE_RETRY_STEP_MS = 50;
+const RESUME_LEASE_RETRY_MAX_MS = 250;
+// Brief drain window after OS process 'exit' before destroying stdio pipes and
+// failing pending RPCs, so a detached grandchild holding stdout/stderr open
+// cannot stall active turns or teardownPromise indefinitely.
+const EXIT_STDIO_DRAIN_MS = 50;
 const DEFAULT_ATOMCODE_IDLE_RELEASE_MS = 120_000;
 
 export type AtomcodeUserInputHandler = (
@@ -130,6 +143,35 @@ interface OpenConnectionOptions {
   onDisconnected?: () => void;
 }
 
+class AtomcodeAcpRpcError extends Error {
+  constructor(detail: string) {
+    super(`atomcode ACP: ${detail}`);
+  }
+}
+
+/** Detect AtomCode's exclusive session-lease conflict on session/resume|load
+ *  (e.g. `session is active in another atomcode process; close it before resuming`)
+ *  without retrying permanent failures such as unknown session or cwd mismatch. */
+function isResumeLeaseBusyError(error: unknown): boolean {
+  if (!(error instanceof AtomcodeAcpRpcError)) return false;
+  return /session is active in another atomcode process|session.{0,24}in use|lease.{0,24}(?:busy|held|locked)/i.test(error.message);
+}
+
+function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new Error('atomcode_acp_aborted'));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('atomcode_acp_aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /** Race a wait against caller abort without cancelling the underlying promise,
  *  so an in-flight teardown still finishes releasing its OS `.lease` lock. */
 function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -170,6 +212,7 @@ class AtomcodeAcpConnection {
   private closingRequested = false;
   private wireClosed = false;
   private failure?: Error;
+  private exitDrainTimer?: ReturnType<typeof setTimeout>;
   private hardKill?: ReturnType<typeof setTimeout>;
   private cancelGraceWait?: () => void;
   private activeTurn?: ActiveTurnState;
@@ -187,12 +230,21 @@ class AtomcodeAcpConnection {
     ];
     this.child = spawnOwnedModelProcess(opts.executable, cliArgs, { cwd: opts.cwd, env });
     this.onDisconnected = opts.onDisconnected;
+    let markExited!: () => void;
     this.exited = new Promise<void>(resolve => {
-      this.child.once('close', () => {
+      markExited = () => {
+        if (this.childExited) return;
         this.childExited = true;
         resolve();
-      });
+      };
     });
+
+    const finalizeExitFailure = () => {
+      clearTimeout(this.exitDrainTimer);
+      this.exitDrainTimer = undefined;
+      this.destroyStreams();
+      if (!this.wireClosed) this.fail(new Error('atomcode_acp_process_exited'));
+    };
 
     const readFrames = createAtomcodeFrameReader(line => {
       this.handleMessage(JSON.parse(line));
@@ -209,14 +261,36 @@ class AtomcodeAcpConnection {
     // Drain stderr without retaining it so verbose tool diagnostics cannot exhaust memory or block the pipe.
     this.child.stderr.resume();
     this.child.stdin.on('error', () => this.fail(new Error('atomcode_acp_transport_closed')));
-    this.child.on('error', () => this.fail(new Error('atomcode_acp_spawn_failed')));
-    // While idle, detach immediately on 'exit' rather than waiting for stdio 'close'
-    // (which can lag a tick or stall if a grandchild still holds a pipe open).
+    this.child.stdout.on('error', () => { /* ignore errors after bounded pipe destroy */ });
+    this.child.stderr.on('error', () => { /* ignore errors after bounded pipe destroy */ });
+    this.child.on('error', () => {
+      markExited();
+      this.destroyStreams();
+      this.fail(new Error('atomcode_acp_spawn_failed'));
+    });
+    // Track OS process exit separately from stdio 'close': a detached grandchild
+    // that inherited stdout/stderr can prevent 'close' from ever firing after the
+    // ACP process itself has exited. Give in-flight RPCs only a brief bounded drain
+    // window for buffered stdout frames before destroying pipes and failing RPCs.
     this.child.once('exit', () => {
-      if (!this.activeTurn && !this.wireClosed) this.fail(new Error('atomcode_acp_process_exited'));
+      markExited();
+      try { this.child.stdin.destroy(); } catch { /* ignore */ }
+      if (this.wireClosed) {
+        this.destroyStreams();
+        return;
+      }
+      if ((this.pending.size === 0 && !this.activeTurn)
+        || this.child.stdout.readableEnded
+        || this.child.stdout.destroyed) {
+        finalizeExitFailure();
+      } else {
+        this.exitDrainTimer = setTimeout(finalizeExitFailure, EXIT_STDIO_DRAIN_MS);
+        this.exitDrainTimer.unref?.();
+      }
     });
     this.child.once('close', () => {
-      if (!this.wireClosed) this.fail(new Error('atomcode_acp_process_exited'));
+      markExited();
+      finalizeExitFailure();
     });
   }
 
@@ -249,11 +323,11 @@ class AtomcodeAcpConnection {
         const canLoad = init.agentCapabilities?.loadSession === true;
         if (!canResume && !canLoad) throw new Error('atomcode_acp_resume_unsupported');
         const method = canResume ? 'session/resume' : 'session/load';
-        control = await conn.request(method, {
+        control = await conn.resumeWithLeaseWait(method, {
           sessionId: conn.sessionId,
           cwd: opts.cwd,
           mcpServers: [],
-        });
+        }, signal);
         if (control.sessionId !== undefined && control.sessionId !== conn.sessionId) {
           throw new Error('atomcode_acp_resume_mismatch');
         }
@@ -471,8 +545,42 @@ class AtomcodeAcpConnection {
     } finally {
       this.wireClosed = true;
       this.cancelGraceWait = undefined;
+      clearTimeout(this.exitDrainTimer);
+      this.exitDrainTimer = undefined;
       clearTimeout(this.hardKill);
       this.hardKill = undefined;
+      this.destroyStreams();
+    }
+  }
+
+  private destroyStreams(): void {
+    try { this.child.stdin.destroy(); } catch { /* ignore */ }
+    try { this.child.stdout.destroy(); } catch { /* ignore */ }
+    try { this.child.stderr.destroy(); } catch { /* ignore */ }
+  }
+
+  /** Retry `session/resume` or `session/load` on the same initialized ACP
+   *  connection while another retiring runner releases the exclusive `.lease`.
+   *  Bounded by `RESUME_LEASE_WAIT_MS` and abortable via caller signal or child exit. */
+  private async resumeWithLeaseWait(
+    method: 'session/resume' | 'session/load',
+    params: Json,
+    signal: AbortSignal,
+  ): Promise<Json> {
+    const deadline = Date.now() + RESUME_LEASE_WAIT_MS;
+    const waitSignal = AbortSignal.any([signal, this.lifetime.signal]);
+    let delayMs = RESUME_LEASE_RETRY_INITIAL_MS;
+    while (true) {
+      try {
+        return await this.request(method, params);
+      } catch (error) {
+        const remaining = deadline - Date.now();
+        if (!isResumeLeaseBusyError(error) || remaining <= 0 || waitSignal.aborted) {
+          throw error;
+        }
+        await sleepWithAbort(Math.min(delayMs, remaining), waitSignal);
+        delayMs = Math.min(delayMs + RESUME_LEASE_RETRY_STEP_MS, RESUME_LEASE_RETRY_MAX_MS);
+      }
     }
   }
 
@@ -631,7 +739,7 @@ class AtomcodeAcpConnection {
         : typeof message.error.message === 'string'
           ? message.error.message
           : 'request failed';
-      entry.reject(new Error(`atomcode ACP: ${detail}`));
+      entry.reject(new AtomcodeAcpRpcError(detail));
     } else if (isObject(message.result)) {
       entry.resolve(message.result);
     } else {

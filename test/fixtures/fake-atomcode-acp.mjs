@@ -1,8 +1,32 @@
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, closeSync, openSync, unlinkSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
 const log = value => process.env.ATOMCODE_TEST_LOG && appendFileSync(process.env.ATOMCODE_TEST_LOG, JSON.stringify(value) + '\n');
 log({ pid: process.pid, ppid: process.ppid, args: process.argv.slice(2), owner: process.env.BOTMUX_OWNER_OPEN_ID, home: process.env.ATOMCODE_HOME });
+
+const leaseFile = process.env.ATOMCODE_ACP_LEASE_FILE;
+let holdsLease = false;
+const acquireLease = () => {
+  if (!leaseFile || holdsLease) return true;
+  try {
+    const fd = openSync(leaseFile, 'wx');
+    closeSync(fd);
+    holdsLease = true;
+    return true;
+  } catch (err) {
+    if (err && err.code === 'EEXIST') return false;
+    throw err;
+  }
+};
+const releaseLease = () => {
+  if (!leaseFile || !holdsLease) return;
+  holdsLease = false;
+  try { unlinkSync(leaseFile); } catch { /* already gone */ }
+};
+process.on('exit', releaseLease);
+process.on('SIGTERM', () => { releaseLease(); process.exit(143); });
+process.on('SIGINT', () => { releaseLease(); process.exit(130); });
 
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\n');
 const NUL = String.fromCharCode(0);
@@ -79,10 +103,27 @@ for await (const line of createInterface({ input: process.stdin })) {
       },
     });
   } else if (method === 'session/new') {
+    acquireLease();
     sessionId = 'acp-fixture-session-1';
     send({ id, result: { sessionId, ...control } });
     update({ sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'compact', description: 'Compact' }] });
   } else if (method === 'session/resume' || method === 'session/load') {
+    if (scenario === 'unknown-session') {
+      send({ id, error: { code: -32602, message: 'Invalid params', data: `unknown session \`${params.sessionId}\`` } });
+      continue;
+    }
+    if (!acquireLease()) {
+      log({ event: 'resume_lease_busy', pid: process.pid, sessionId: params.sessionId });
+      send({
+        id,
+        error: {
+          code: -32602,
+          message: 'Invalid params',
+          data: 'session is active in another atomcode process; close it before resuming',
+        },
+      });
+      continue;
+    }
     sessionId = params.sessionId;
     update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STALE REPLAY MUST BE IGNORED' } });
     send({ id, result: { ...(scenario === 'resume-mismatch' ? { sessionId: 'acp-other' } : {}), ...control } });
@@ -99,6 +140,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     if (closeDelay > 0) {
       await new Promise(resolve => setTimeout(resolve, closeDelay));
     }
+    releaseLease();
     log({ event: 'close_done', pid: process.pid });
     send({ id, result: {} });
   } else if (method === 'session/cancel') {
@@ -109,6 +151,16 @@ for await (const line of createInterface({ input: process.stdin })) {
     promptText = params.prompt[0].text;
     if (promptText === 'hang') continue;
     if (promptText === 'crash') process.exit(4);
+    if (promptText === 'detached-grandchild-crash' || promptText === 'detached-grandchild-hang') {
+      const sleeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 15000)'], {
+        detached: true,
+        stdio: ['ignore', 'inherit', 'inherit'],
+      });
+      sleeper.unref();
+      log({ event: 'grandchild_spawned', pid: process.pid, grandchildPid: sleeper.pid });
+      if (promptText === 'detached-grandchild-crash') process.exit(9);
+      continue;
+    }
     if (promptText === 'invalid-json') { process.stdout.write('not-json\n'); continue; }
     if (promptText === 'idle-exit-after-turn') {
       complete('ok-before-idle-exit');

@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -654,5 +654,128 @@ describe('AtomcodeAcpSession persistent lifecycle', () => {
     await expect(turn).rejects.toThrow(/aborted/);
     expect(f.readLog().some(e => e.event === 'cancel_received')).toBe(true);
     await session.close();
+  });
+
+  it('retries session/resume on the same ACP process until a busy lease releases, fails fast on non-lease errors, and honors abort', async () => {
+    // 1. Exclusive lease held at resume time and released 450ms later -> retries on 1 spawn and succeeds.
+    const fBusy = createFixture();
+    const leaseFile = join(fBusy.root, 'session.lease');
+    writeFileSync(leaseFile, 'held');
+    const releaseTimer = setTimeout(() => { try { unlinkSync(leaseFile); } catch { /* ignore */ } }, 450);
+    const sBusy = new AtomcodeAcpSession({
+      executable: fBusy.bin,
+      cwd: fBusy.root,
+      env: { ...fBusy.env, ATOMCODE_ACP_LEASE_FILE: leaseFile },
+      nativeSessionId: 'acp-fixture-session-1',
+      permission: 'full',
+      idleTimeoutMs: 30_000,
+    });
+    try {
+      const result = await sBusy.runTurn({
+        content: 'after-lease-release',
+        onUserInput: async () => ({}),
+      }, new AbortController().signal);
+      expect(result).toEqual({
+        sessionId: 'acp-fixture-session-1',
+        content: 'echo:after-lease-release|mode=bypass|model=demo-default|effort=off',
+      });
+    } finally {
+      clearTimeout(releaseTimer);
+      await sBusy.close();
+    }
+    const busyEntries = fBusy.readLog();
+    expect(busyEntries.filter(e => Array.isArray(e.args))).toHaveLength(1);
+    expect(busyEntries.some(e => e.event === 'resume_lease_busy')).toBe(true);
+    expect(busyEntries.filter(e => e.message?.method === 'session/resume').length).toBeGreaterThanOrEqual(2);
+
+    // 2. Non-lease RPC errors (e.g. unknown session) must fail immediately without retrying.
+    const fUnknown = createFixture({ ATOMCODE_ACP_SCENARIO: 'unknown-session' });
+    await expect(runSingleTurn({
+      executable: fUnknown.bin,
+      cwd: fUnknown.root,
+      env: fUnknown.env,
+      nativeSessionId: 'acp-missing',
+      content: 'hello',
+      permission: 'full',
+      onUserInput: async () => ({}),
+    }, new AbortController().signal)).rejects.toThrow(/unknown session/);
+    expect(fUnknown.readLog().filter(e => e.message?.method === 'session/resume')).toHaveLength(1);
+
+    // 3. Caller abort during lease retry backoff unblocks immediately instead of waiting out the full budget.
+    const fAbort = createFixture();
+    const stuckLease = join(fAbort.root, 'stuck.lease');
+    writeFileSync(stuckLease, 'held-forever');
+    const sAbort = new AtomcodeAcpSession({
+      executable: fAbort.bin,
+      cwd: fAbort.root,
+      env: { ...fAbort.env, ATOMCODE_ACP_LEASE_FILE: stuckLease },
+      nativeSessionId: 'acp-fixture-session-1',
+      permission: 'full',
+      idleTimeoutMs: 30_000,
+    });
+    const controller = new AbortController();
+    const t0 = Date.now();
+    const abortTurn = sAbort.runTurn({
+      content: 'should-abort',
+      onUserInput: async () => ({}),
+    }, controller.signal);
+    await waitFor(() => fAbort.readLog().some(e => e.event === 'resume_lease_busy'));
+    controller.abort();
+    await expect(abortTurn).rejects.toThrow(/aborted/);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    await sAbort.close(false);
+  });
+
+  it('settles active turns and teardown promptly on OS exit even when a detached grandchild inherits stdio', async () => {
+    const f = createFixture();
+    const session = new AtomcodeAcpSession({
+      executable: f.bin,
+      cwd: f.root,
+      env: f.env,
+      permission: 'full',
+      idleTimeoutMs: 30_000,
+    });
+    const grandchildPids: number[] = [];
+    try {
+      const seed = await session.runTurn({
+        content: 'seed',
+        onUserInput: async () => ({}),
+      }, new AbortController().signal);
+      expect(seed.sessionId).toBe('acp-fixture-session-1');
+
+      // 1. Mid-turn crash with detached grandchild holding stdout/stderr open must reject promptly.
+      const tCrash = Date.now();
+      await expect(session.runTurn({
+        content: 'detached-grandchild-crash',
+        onUserInput: async () => ({}),
+      }, new AbortController().signal)).rejects.toThrow(/atomcode_acp_process_exited/);
+      expect(Date.now() - tCrash).toBeLessThan(2_000);
+
+      // 2. Subsequent turn must resume cleanly instead of hanging on teardownPromise.
+      const recovered = await session.runTurn({
+        content: 'after-detached-crash',
+        onUserInput: async () => ({}),
+      }, new AbortController().signal);
+      expect(recovered.content).toContain('echo:after-detached-crash');
+
+      // 3. Force close while a hung turn has a detached grandchild holding stdio must settle promptly.
+      const hangTurn = session.runTurn({
+        content: 'detached-grandchild-hang',
+        onUserInput: async () => ({}),
+      }, new AbortController().signal);
+      await waitFor(() => f.readLog().filter(e => e.event === 'grandchild_spawned').length === 2);
+      const tClose = Date.now();
+      await session.close(false);
+      await expect(hangTurn).rejects.toThrow();
+      expect(Date.now() - tClose).toBeLessThan(2_500);
+    } finally {
+      for (const entry of f.readLog()) {
+        if (typeof entry.grandchildPid === 'number') grandchildPids.push(entry.grandchildPid);
+      }
+      for (const pid of grandchildPids) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      await session.close(false);
+    }
   });
 });

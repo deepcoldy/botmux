@@ -54,12 +54,16 @@ async function waitFor(check: () => boolean) {
   }
 }
 
-function startRunner(extra: string[] = [], hiddenEntry = false) {
-  const f = fixture();
+function startRunner(
+  extra: string[] = [],
+  hiddenEntry = false,
+  opts?: { existingFixture?: ReturnType<typeof fixture>; extraEnv?: Record<string, string> },
+) {
+  const f = opts?.existingFixture ?? fixture();
   const child = spawnTsScript(
     resolve('src/atomcode-runner.ts'),
     [...(hiddenEntry ? ['__atomcode-runner'] : []), '--atomcode-bin', f.executable, '--cwd', f.root, '--data-dir', join(f.root, 'home'), ...extra],
-    { env: { ...process.env, ATOMCODE_TEST_LOG: f.log } },
+    { env: { ...process.env, ATOMCODE_TEST_LOG: f.log, ...opts?.extraEnv } },
   ) as ChildProcessWithoutNullStreams;
   children.push(child);
   const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(r =>
@@ -185,5 +189,53 @@ describe('atomcode-runner', () => {
 
     const final = markers(r.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-budget')?.payload;
     expect(final).toMatchObject({ errorCode: 'turn_budget_exhausted', turnId: 'turn-budget' });
+  });
+
+  it('waits out a retiring runner slow session/close across PTY SIGHUP restart without failing preserved input', async () => {
+    const shared = fixture();
+    const leaseFile = join(shared.root, 'session.lease');
+    const oldRunner = startRunner([], false, {
+      existingFixture: shared,
+      extraEnv: {
+        ATOMCODE_ACP_LEASE_FILE: leaseFile,
+        ATOMCODE_ACP_CLOSE_DELAY_MS: '2000',
+      },
+    });
+    await waitFor(() => /^›$/m.test(oldRunner.h.stdout));
+
+    oldRunner.send('warm-turn-1', 'turn-1');
+    await waitFor(() => markers(oldRunner.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-1'));
+
+    // Mimic worker PTY in-place restart: SIGHUP old runner, then spawn replacement
+    // 500ms later with the same nativeSessionId and immediately deliver preserved input.
+    oldRunner.h.child.kill('SIGHUP');
+    await waitFor(() => readCalls(shared.log).some(e => e.message?.method === 'session/close'));
+    await new Promise(r => setTimeout(r, 500));
+
+    const newRunner = startRunner(['--native-session-id', 'acp-fixture-session-1'], false, {
+      existingFixture: shared,
+      extraEnv: { ATOMCODE_ACP_LEASE_FILE: leaseFile },
+    });
+    await waitFor(() => /^›$/m.test(newRunner.h.stdout));
+    newRunner.send('preserved-after-sighup', 'turn-2');
+
+    await waitFor(() => markers(newRunner.h.stdout).some(m => m.kind === 'final' && m.payload.turnId === 'turn-2'));
+    const oldExit = await oldRunner.h.closed;
+    expect(oldExit.code).toBe(0);
+
+    const turn2Final = markers(newRunner.h.stdout).find(m => m.kind === 'final' && m.payload.turnId === 'turn-2')?.payload;
+    expect(turn2Final).toMatchObject({
+      content: 'echo:preserved-after-sighup|mode=bypass|model=demo-default|effort=off',
+      turnId: 'turn-2',
+    });
+    expect(turn2Final?.errorCode).toBeUndefined();
+
+    const calls = readCalls(shared.log);
+    const busyIdx = calls.findIndex(e => e.event === 'resume_lease_busy');
+    const closeDoneIdx = calls.findIndex(e => e.event === 'close_done');
+    expect(busyIdx).toBeGreaterThan(-1);
+    expect(closeDoneIdx).toBeGreaterThan(busyIdx);
+    // Exactly 2 ACP spawns total (old + replacement); retries happened on the live replacement ACP process.
+    expect(calls.filter(e => Array.isArray(e.args))).toHaveLength(2);
   });
 });
