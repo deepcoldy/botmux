@@ -152,7 +152,7 @@ describe('deferred scheduled input retired by coalesce while its write-edge admi
     // A stays retired: not queued again, not rejected twice, never written.
     expect(h.scope.pendingMessages).not.toContain(runA);
     expect(rejections(runA.turnId)).toBe(1);
-    await h.flush();
+    // The same flush moves on to B: no further ready edge is needed.
     const written = h.scope.cliAdapter.writeInput.mock.calls.map(([, message]: [unknown, string]) => message);
     expect(written).toEqual(['run B']);
     expect(rejections(turnB)).toBe(0);
