@@ -1128,6 +1128,14 @@ function claudeTerminalTitle(terminalTitle: unknown, cliId: CliId, agentKind: un
   return generic.includes(title.toLowerCase()) ? undefined : title;
 }
 
+/** Whether discovery can produce a native title for a live pane of this CLI
+ * (Claude: terminal title; TraeX: thread title). The single list of such CLIs:
+ * herdrLiveTitleFields looks one up only for them, and the /adopt card names an
+ * untitled pane of any other CLI after its directory instead. */
+export function hasNativeLiveTitle(cliId: CliId): boolean {
+  return cliId === 'claude-code' || cliId === 'traex';
+}
+
 /** Display fields for a herdr pane: the manual pane label (any CLI), the native
  * title (Claude terminal title; TraeX thread title, only looked up when no label
  * would win over it) and `title` = label ?? native title. Missing fields (older
@@ -1140,8 +1148,10 @@ function herdrLiveTitleFields(
   sessionId: string | undefined,
 ): Pick<AdoptableSession, 'title' | 'herdrPaneLabel' | 'herdrNativeTitle'> {
   const paneLabel = cleanLiveAdoptTitle(label);
-  const nativeTitle = claudeTerminalTitle(terminalTitle, cliId, agentKind)
-    ?? (!paneLabel && cliId === 'traex' ? traexLiveTitle(sessionId) : undefined);
+  const nativeTitle = hasNativeLiveTitle(cliId)
+    ? claudeTerminalTitle(terminalTitle, cliId, agentKind)
+      ?? (!paneLabel && cliId === 'traex' ? traexLiveTitle(sessionId) : undefined)
+    : undefined;
   const title = paneLabel ?? nativeTitle;
   return {
     ...(title ? { title } : {}),

@@ -5,13 +5,13 @@ import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { CLI_DISPLAY_NAMES, lookupCliDisplayName } from '../../adapters/cli/display-names.js';
 import { allowlistSandboxVerifiedClis } from '../../core/shared-bot-sandbox-advice.js';
-import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
+import { adoptTargetKey, adoptTargetLabel, hasNativeLiveTitle, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
 import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
-import { countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
+import { cleanLiveAdoptTitle, countHerdrTabGroups, herdrTabGroupKey, joinLiveTitle } from '../../utils/live-title.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { formatClockTime } from '../../utils/clock-time.js';
@@ -3644,19 +3644,26 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession | Orca
 /** Title of a live herdr entry named after its tab. Alone in the tab: pane
  *  label > the tab's given name > native title (Claude: terminal title, else
  *  first prompt) > the tab's default name. Sharing the tab with other entries
- *  of this card: `<tab> · <pane label | native title | untitled>`. Undefined
- *  unless the picker's enrichment found the tab; the caller then keeps the
- *  discovery title exactly as before. */
-function herdrTabTitle(s: AdoptableSession, tabGroups: Map<string, number>, untitled: string): string | undefined {
+ *  of this card: `<tab> · <pane label | native title | untitled>`. Those last
+ *  tiers hold for a CLI with a native title source (hasNativeLiveTitle); any
+ *  other CLI never gets a native title, so its untitled pane ends on the
+ *  directory name `project` instead, cleaned like other live titles: alone →
+ *  `project`, sharing → `<tab> · project`. A directory name that cleans to
+ *  nothing keeps the default tab name / untitled. Undefined unless the
+ *  picker's enrichment found the tab; the caller then keeps the discovery
+ *  title exactly as before. */
+function herdrTabTitle(s: AdoptableSession, tabGroups: Map<string, number>, untitled: string, project: string): string | undefined {
   if (s.source !== 'herdr' || !s.herdrTabLabel || s.herdrTabAutoNamed === undefined) return undefined;
   const groupKey = herdrTabGroupKey(s);
   const native = s.herdrNativeTitle ?? s.herdrFirstPrompt;
+  const dirName = hasNativeLiveTitle(s.cliId) ? undefined : cleanLiveAdoptTitle(project);
   if ((groupKey ? tabGroups.get(groupKey) ?? 0 : 0) > 1) {
-    return joinLiveTitle(s.herdrTabLabel, s.herdrPaneLabel ?? native ?? untitled);
+    return joinLiveTitle(s.herdrTabLabel, s.herdrPaneLabel ?? native ?? dirName ?? untitled);
   }
   return s.herdrPaneLabel
     ?? (s.herdrTabAutoNamed ? undefined : s.herdrTabLabel)
     ?? native
+    ?? dirName
     ?? s.herdrTabLabel;
 }
 
@@ -3690,7 +3697,7 @@ export function buildAdoptEntries(
     else target = adoptTargetLabel(s);
     // Only herdr / tmux entries carry herdr names; zellij and Orca never do.
     const herdrLike = isOrcaAdoptCandidate(s) || zellij ? undefined : s;
-    const tabTitle = herdrLike ? herdrTabTitle(herdrLike, tabGroups, untitledLive) : undefined;
+    const tabTitle = herdrLike ? herdrTabTitle(herdrLike, tabGroups, untitledLive, project) : undefined;
     const workspace = herdrLike?.herdrWorkspaceLabel;
     const tabName = herdrLike?.herdrTabAutoNamed !== undefined ? herdrLike.herdrTabLabel : undefined;
     const aliases = [workspace, tabName].filter((a): a is string => !!a);

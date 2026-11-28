@@ -39,6 +39,7 @@ import { LOCAL_CLI_IDS } from '../src/services/local-cli-opener.js';
 import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
 import { resolveCliRuntime } from '../src/adapters/cli/runtime.js';
 import { configuredRuntimeDisplayName } from '../src/core/cli-runtime-display.js';
+import { LIVE_TITLE_MAX } from '../src/utils/live-title.js';
 
 // The terminal button's URL wrapping now depends on the global dashboard
 // setting `openTerminalInFeishu` (read via readGlobalConfig at build time):
@@ -643,6 +644,83 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
       expect(keysFor('示例空间')).toEqual([adoptLiveKey(shared[0]!), adoptLiveKey(shared[1]!)]);
       expect(keysFor('整理笔记')).toEqual([adoptLiveKey(shared[0]!), adoptLiveKey(shared[1]!)]);
       expect(keysFor('整理示例数据')).toEqual([adoptLiveKey(orca as any)]);
+    });
+
+    it('codex (no native title source) alone in its tab: pane label > given tab name > directory name', () => {
+      expect([
+        tabbed({ cliId: 'codex', herdrPaneLabel: '修复登录页样式', title: '修复登录页样式' }),
+        tabbed({ cliId: 'codex' }),
+        tabbed({ cliId: 'codex', ...defaultTab }),
+      ].map(s => titles([s])[0])).toEqual([
+        '**修复登录页样式**',
+        '**整理笔记**',
+        '**demo**',
+      ]);
+    });
+
+    it('codex (no native title source) sharing a tab: <tab> · pane label / directory name, in zh and en, default tab name included', () => {
+      const shared = [
+        tabbed({ cliId: 'codex', herdrPaneId: 'w1:p1', herdrPaneLabel: '修复登录页样式', title: '修复登录页样式' }),
+        tabbed({ cliId: 'codex', herdrPaneId: 'w1:p2', cwd: '/work/alpha' }),
+        tabbed({ cliId: 'codex', herdrPaneId: 'w1:p3', cwd: '/work/beta' }),
+      ];
+      const defaultNamed = shared.map(s => ({ ...s, ...defaultTab }));
+      for (const locale of ['zh', 'en'] as const) {
+        expect(titles(shared, locale)).toEqual([
+          '**整理笔记 · 修复登录页样式**',
+          '**整理笔记 · alpha**',
+          '**整理笔记 · beta**',
+        ]);
+        expect(titles(defaultNamed, locale)).toEqual([
+          '**1 · 修复登录页样式**',
+          '**1 · alpha**',
+          '**1 · beta**',
+        ]);
+        for (const title of [...titles(shared, locale), ...titles(defaultNamed, locale)]) {
+          expect(title).not.toMatch(/新会话|New session/);
+        }
+      }
+    });
+
+    it('pi (no native title source) gets the directory name too, so it is not a codex special case', () => {
+      const pi = (extra: Partial<AdoptableSession> = {}) => tabbed({ cliId: 'pi', ...defaultTab, ...extra });
+      expect(titles([pi()])).toEqual(['**demo**']);
+      expect(titles([pi({ herdrPaneId: 'w1:p1', cwd: '/work/alpha' }), pi({ herdrPaneId: 'w1:p2', cwd: '/work/beta' })]))
+        .toEqual(['**1 · alpha**', '**1 · beta**']);
+    });
+
+    it('codex (no native title source) directory name is cleaned and capped like other live titles; one that cleans to nothing keeps the old fallback', () => {
+      const codex = (extra: Partial<AdoptableSession>) => tabbed({ cliId: 'codex', ...defaultTab, ...extra });
+      // 200 ASCII characters: capped to the same limit as every other live title.
+      const longDir = `${'a'.repeat(120)}\n${'b'.repeat(79)}`;
+      const [alone] = buildAdoptEntries([codex({ cwd: `/work/${longDir}` })], []).map(e => e.title);
+      const [sharing] = buildAdoptEntries([
+        codex({ herdrPaneId: 'w1:p1', cwd: `/work/${longDir}` }),
+        codex({ herdrPaneId: 'w1:p2' }),
+      ], []).map(e => e.title);
+      expect(alone!.startsWith('a'.repeat(20))).toBe(true);
+      expect(sharing!.startsWith(`1 · ${'a'.repeat(20)}`)).toBe(true);
+      for (const title of [alone!, sharing!]) {
+        expect(title).not.toMatch(/[\r\n]/);
+        expect(Array.from(title).length).toBeLessThanOrEqual(LIVE_TITLE_MAX);
+      }
+      // A short directory name with a line break: cleaned to one line, not cut.
+      const broken = '/work/alpha\nbeta';
+      expect(titles([codex({ cwd: broken })])).toEqual(['**alpha beta**']);
+      expect(titles([codex({ herdrPaneId: 'w1:p1', cwd: broken }), codex({ herdrPaneId: 'w1:p2' })]))
+        .toEqual(['**1 · alpha beta**', '**1 · demo**']);
+      // A directory name of only whitespace / control characters.
+      const blank = '/work/ \u0007 ';
+      expect(titles([codex({ cwd: blank })])).toEqual(['**1**']);
+      expect(titles([codex({ herdrPaneId: 'w1:p1', cwd: blank }), codex({ herdrPaneId: 'w1:p2' })]))
+        .toEqual(['**1 · New session**', '**1 · demo**']);
+    });
+
+    it('keeps traex (native title source) on the default tab name alone and untitled when sharing while it has no title', () => {
+      const traex = (extra: Partial<AdoptableSession> = {}) => tabbed({ cliId: 'traex', ...defaultTab, ...extra });
+      expect(titles([traex()])).toEqual(['**1**']);
+      expect(titles([traex({ herdrPaneId: 'w1:p1', cwd: '/work/alpha' }), traex({ herdrPaneId: 'w1:p2', cwd: '/work/beta' })]))
+        .toEqual(['**1 · New session**', '**1 · New session**']);
     });
   });
 });
