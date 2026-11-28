@@ -109,6 +109,21 @@ it('rejects protected rich text before authored content or media keys enter the 
   expect(JSON.stringify(f.store.read())).not.toContain('file_sensitive');
 });
 
+it('rejects a TRAE callback before the synchronous capture journal', async () => {
+  const f = fixture();
+  const secret = 'PRE_ACK_TRAE_CALLBACK_SECRET';
+  const callback = f.raw('om_trae_callback', 'post', { zh_cn: { title: '', content: [[
+    { tag: 'at', user_id: 'ou_bot', user_name: 'Bot' },
+    { tag: 'text', text: `/dashboard trae-login complete req-1 http://127.0.0.1:1234/authorize?token=${secret}` },
+  ]] } });
+  expect(f.capture(callback)).toBe(false);
+  await f.runtime.drain();
+  expect(f.store.read().inputs).toEqual([]);
+  expect(JSON.stringify(f.store.read())).not.toContain(secret);
+
+  expect(f.capture(f.raw('om_capture_positive', 'text', { text: 'ordinary capture remains enabled' }))).toBe(true);
+});
+
 it('rejects changed resources on replay and delivers original pending evidence after revocation and restart', async () => {
   const f = fixture(); const event = f.raw('om_file', 'file', { file_key: 'file_original' });
   expect(f.capture(event)).toBe(true); await f.runtime.drain();

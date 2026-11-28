@@ -35,7 +35,8 @@ describe('TRAE login through the sessionless administrator command', () => {
       parseEventMessage({ sender: { sender_id: { open_id: admin }, sender_type: 'user' }, message: {
         message_id: 'om_callback', chat_id: 'oc_dm', chat_type: 'p2p', message_type: 'post', create_time: '100',
         content: JSON.stringify({ zh_cn: { title: '', content: [[
-          { tag: 'text', text: '/dashboard trae-login complete request ' },
+          { tag: 'text', text: '/dashboard trae-login comp' },
+          { tag: 'text', text: 'lete request ' },
           { tag: 'a', text: 'http://127.0.0.1:1234/authorize?token=PARSER_PRIVATE_SECRET',
             href: 'http://127.0.0.1:1234/authorize?token=PARSER_PRIVATE_SECRET' },
         ]] } }),

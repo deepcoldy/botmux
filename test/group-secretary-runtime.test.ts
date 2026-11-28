@@ -120,6 +120,42 @@ describe('group secretary runtime — hardening', () => {
     };
   }
 
+  it('excludes TRAE login callbacks from observation but still delivers ordinary messages', async () => {
+    setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
+    const { rt, deliver } = runtime([]);
+    setGroupSecretaryRuntime(rt);
+    const secret = 'SECRETARY_TRAE_CALLBACK_SECRET';
+    const callback = textEvent('om_trae_callback', clock);
+    callback.message.content = JSON.stringify({
+      text: `/dashboard trae-login complete req-1 http://127.0.0.1:1234/authorize?token=${secret}`,
+    });
+    try {
+      // The same conversion also guards restart backfill before engine.observeMessage.
+      expect(larkEventToSecretaryMessage(callback, 'ou_self', APP)).toBeUndefined();
+      const discussion = { ...callback, message: { ...callback.message, message_type: 'post', content: JSON.stringify({
+        zh_cn: { title: '', content: [[
+          { tag: 'at', user_id: 'ou_bot', user_name: 'Bot' },
+          { tag: 'text', text: '请解释 /dashboard trae-login complete 命令的含义' },
+        ]] },
+      }) } };
+      expect(larkEventToSecretaryMessage(discussion, 'ou_self', APP)?.text).toContain('/dashboard trae-login complete');
+      observeGroupSecretaryMessage(callback);
+      clock += 60_000;
+      await rt.tick();
+      expect(deliver).not.toHaveBeenCalled();
+
+      observeGroupSecretaryMessage(textEvent('om_normal_after_callback', clock));
+      clock += 60_000;
+      await rt.tick();
+      expect(deliver).toHaveBeenCalledTimes(1);
+      const prompt = (deliver.mock.calls[0] as any[])[0].prompt as string;
+      expect(prompt).toContain('om_normal_after_callback');
+      expect(prompt).not.toContain(secret);
+    } finally {
+      setGroupSecretaryRuntime(undefined);
+    }
+  });
+
   it('a slow snapshot fetch is not re-entered by the next tick', async () => {
     setGroupSecretaryChat(CHAT, { larkAppId: APP, enabledBy: 'ou_owner', enabledAt: 1 });
     let release!: (s: ObserveSnapshot) => void;

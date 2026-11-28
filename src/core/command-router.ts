@@ -1,4 +1,5 @@
 import { normalizeDelegatedSlashCommand } from './delegated-slash.js';
+import { isTraeLoginCompleteCommandText } from './trae-login-command.js';
 /**
  * 命令路由器 —— 斜杠命令的**分类层**（设计 docs/design/2026-09-11-command-router.md R1 / §5）。
  *
@@ -63,7 +64,7 @@ export function parseSlashCommandInvocation(
   // Callback control input can contain malformed URLs/angle brackets or
   // pasted newlines. Keep it on the administrator path for validation; it
   // must never become a model prompt merely because the syntax is invalid.
-  if (cmd === '/dashboard' && /^\/dashboard\s+trae-login\s+complete\b/i.test(trimmed)) {
+  if (cmd === '/dashboard' && isTraeLoginCompleteCommandText(trimmed)) {
     return { cmd, content: trimmed };
   }
 

@@ -9,6 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveEntrySpawn } from '../core/self-spawn.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { isTraeLoginCompleteCommandText } from '../core/trae-login-command.js';
 
 export interface TraeLoginTarget { bin: string; root: string; env: NodeJS.ProcessEnv }
 export interface TraeLoginOwner { appId: string; openId: string }
@@ -23,7 +24,7 @@ interface Attempt extends TraeLoginView {
 }
 
 export function redactTraeLoginCommand(text: string, commandText = text): string {
-  return /^\s*\/dashboard\s+trae-login\s+complete\b/i.test(commandText)
+  return isTraeLoginCompleteCommandText(commandText)
     ? '/dashboard trae-login complete [redacted]' : text;
 }
 

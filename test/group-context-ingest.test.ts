@@ -104,6 +104,24 @@ describe('开关', () => {
     expect(text).not.toContain('TEST_ONLY_VALUE');
   });
 
+  it('never persists a TRAE login callback, but keeps discussion about the command', () => {
+    setGroupContextSettingsResolver(() => ({ enabled: true }));
+    const secret = 'GROUP_CONTEXT_TRAE_CALLBACK_SECRET';
+    expect(ingestGroupContextEvent(APP, event({ messageId: 'om_trae_callback',
+      text: `/dashboard trae-login complete req-1 http://127.0.0.1:1234/authorize?token=${secret}`,
+    }))).toBe('skipped_sensitive');
+    expect(getGroupContextMessage(APP, CHAT, 'om_trae_callback')).toBeUndefined();
+    expect(JSON.stringify(listGroupContextMessages(APP, CHAT))).not.toContain(secret);
+
+    expect(ingestGroupContextEvent(APP, event({ messageId: 'om_trae_discussion', msgType: 'post',
+      content: JSON.stringify({ zh_cn: { title: '', content: [[
+        { tag: 'at', user_id: 'ou_bot', user_name: 'Bot' },
+        { tag: 'text', text: '请解释 /dashboard trae-login complete 命令的含义' },
+      ]] } }),
+    }))).toBe('stored');
+    expect(getGroupContextMessage(APP, CHAT, 'om_trae_discussion')?.text).toContain('/dashboard trae-login complete');
+  });
+
   it('未注册 resolver → disabled，零写入（默认关）', () => {
     expect(ingestGroupContextEvent(APP, event())).toBe('disabled');
     expect(listGroupContextMessages(APP, CHAT).messages).toHaveLength(0);

@@ -31,3 +31,9 @@ v1 仅 Linux 宿主的原生本地 `traex` 配置可用，依赖 util-linux 的 
 第二轮实机探针又发现监督进程自身强杀后会遗留 native，因此最终方案让 native 通过 flock --no-fork 继承内核锁，并以 setpriv --pdeathsig KILL 绑定父进程死亡；设置后核验 PPID，覆盖父进程在信号设置之前死亡的窗口。普通讨论正文中的命令示例不触发 callback 过滤，仅实际命令头和回调输入受影响。
 
 本机对 bare `traecli login` 的独立目录探测也观察到同一企业授权域、/authorize loopback 回调和 stdin 远程输入指引，所用流程与本机默认登录一致。隐私分类按实际 complete 命令头判断，即使缺请求 ID 或 URL 格式错误也打码；语法校验在控制处理器内完成。历史恢复跳过敏感 callback，REST body.content 的重复正文也打码。
+
+## 回调隐私的统一直接分类与旁听边界
+
+回调识别采用不依赖消息 parser 的文本/AST 分类，避免模块反向依赖，也避免把 parser 异常当成普通消息。post 在同段内无空格拼接相邻文本节点，前导 mention 只按真实 `at` AST 节点剥离；text 只剥离可证明的 structured mention、`_user_N` 占位或完整 `<at>` 标签。无元数据的紧贴命令仅用窄回退识别，不把通用 `@\S+` 应用到普通讨论。null 节点、缺失 mention 名称等 malformed 形状仍需打码。
+
+敏感控制输入必须在所有持久化/观察 sink 自带边界处排除，而不依赖调用先后顺序：pre-ACK 与 durable claim 后的 input-capture、group-context 的 live receive/edit、chat/thread REST history 与 publication、secretary 的实时观察和重启 backfill。durable primary/shadow/recovery 门控和 serializer 兜底继续保留。普通讨论（包括 mention 后紧贴的“请解释 complete 命令”）必须照常旁听，群 complete 仍由命令层返回 private_only。回归探针覆盖真实 capture journal，以及“live 跳过 → REST 回填 → 清空 REST 后的下一 turn 仍无 secret”。
