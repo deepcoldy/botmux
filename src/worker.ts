@@ -33253,6 +33253,9 @@ async function flushPending(): Promise<void> {
         if (await postTerminalInputIsBlocked(target)
           || backend !== target || generation !== cliSpawnGeneration
           || cliRestartInProgress || webTerminalInputWireDirty()) break;
+        // A lifecycle path (STOP, coalesce, cancel) may have emptied the queue
+        // during that await.
+        if (pendingMessages.length === 0) break;
       }
       if (activeTurnBlocks(pendingMessages[0]!)) {
         if (typeof backgroundAuthorityHold !== 'undefined' && backgroundAuthorityHold.isIdleWaiting()) {

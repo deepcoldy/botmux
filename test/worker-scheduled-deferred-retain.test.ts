@@ -814,6 +814,29 @@ describe('STOP after a held scheduled write armed its retry, before the retry fi
     expect(rejections(runA.turnId)).toBe(1);
   });
 
+  it('STOP emptying the queue while a retry awaits the post-terminal prompt fence ends that flush cleanly', async () => {
+    const { h, item: runA, rejections, fireRetry } = scheduledHarness(['allow', 'retain', 'allow', 'allow'], true);
+    h.scope.cliInterruptGeneration = 0;
+    await h.flush();
+    expect(h.scope.pendingMessages).toEqual([runA]);
+
+    // TraeX/ZCode await their post-terminal surface before each queued write.
+    h.scope.cliAdapter.postTerminalPromptFence = true;
+    // The first await is flushPending's entry fence; STOP lands in the
+    // per-item fence inside the drain loop.
+    let fenceChecks = 0;
+    h.scope.postTerminalInputIsBlocked = vi.fn(async () => {
+      if (++fenceChecks === 2) await stopCli(h.scope);
+      return false;
+    });
+    await fireRetry();
+    expect(fenceChecks).toBe(2);
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(rejections(runA.turnId)).toBe(1);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.isFlushing).toBe(false);
+  });
+
   it('a head-gate retain never became the writer: STOP leaves it queued and the retry writes it once', async () => {
     // The pre-dequeue gate retains; STOP with no scheduled turn or writer has
     // no target, exactly as it would have had it arrived during that gate.
